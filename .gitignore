@@ -30,3 +30,26 @@ m5out
 /system/arm/bootloader/arm64/boot_v2.arm64
 configs/example/memcheck.cfg
 configs/dram/lowp_sweep.cfg
+
+# Docker related
+.bashrc
+.bash_history
+.vimrc
+
+# experiment related
+ckpt/
+run/
+output*/
+suites/
+settings.json
+log*
+
+# debug related
+*.dump
+*.csv
+
+# cache, IDE related
+.cache/
+.local/
+.vscode/
+.idea/

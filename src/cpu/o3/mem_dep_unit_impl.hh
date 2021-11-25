@@ -47,6 +47,8 @@
 #include "cpu/o3/inst_queue.hh"
 #include "cpu/o3/mem_dep_unit.hh"
 #include "debug/MemDepUnit.hh"
+#include "debug/Tracer.hh"
+#include "cpu/global_utils.hh"
 #include "params/DerivO3CPU.hh"
 
 template <class MemDepPred, class Impl>
@@ -356,6 +358,8 @@ MemDepUnit<MemDepPred, Impl>::regsReady(const DynInstPtr &inst)
             "instruction PC %s [sn:%lli].\n",
             inst->pcState(), inst->seqNum);
 
+    CSPRINT(RegReady, inst, "can Eager: %d\n", inst->canEagerTranslation());
+
     MemDepEntryPtr inst_entry = findInHash(inst);
 
     inst_entry->regsReady = true;
@@ -406,6 +410,7 @@ MemDepUnit<MemDepPred, Impl>::replay()
         DPRINTF(MemDepUnit, "Replaying mem instruction PC %s [sn:%lli].\n",
                 temp_inst->pcState(), temp_inst->seqNum);
 
+        DSTATE(Replay, inst_entry->inst);
         moveToReady(inst_entry);
 
         instsToReplay.pop_front();
@@ -418,6 +423,8 @@ MemDepUnit<MemDepPred, Impl>::completed(const DynInstPtr &inst)
 {
     DPRINTF(MemDepUnit, "Completed mem instruction PC %s [sn:%lli].\n",
             inst->pcState(), inst->seqNum);
+
+    DSTATE(Complete, inst);
 
     ThreadID tid = inst->threadNumber;
 
@@ -577,6 +584,9 @@ MemDepUnit<MemDepPred, Impl>::findInHash(const DynInstConstPtr &inst)
 {
     MemDepHashIt hash_it = memDepHash.find(inst->seqNum);
 
+    if (hash_it == memDepHash.end()) {
+        DPRINTF(Tracer, "%#x@%lu: [HashMiss]\n", inst->instAddr(), inst->seqNum);
+    }
     assert(hash_it != memDepHash.end());
 
     return (*hash_it).second;

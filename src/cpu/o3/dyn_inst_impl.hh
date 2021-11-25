@@ -181,6 +181,13 @@ BaseO3DynInst<Impl>::completeAcc(PacketPtr pkt)
 }
 
 template <class Impl>
+Fault
+BaseO3DynInst<Impl>::setStoreData() {
+    this->fault = this->staticInst->setStoreData(this);
+    return this->fault;
+}
+
+template <class Impl>
 void
 BaseO3DynInst<Impl>::trap(const Fault &fault)
 {

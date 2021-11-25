@@ -266,6 +266,10 @@ class ExecContext {
                            const std::vector<bool>& byte_enable =
                                std::vector<bool>()) = 0;
 
+    virtual Fault setMemData(uint8_t *data) {
+        panic("setMemData should be overridden\n");
+    }
+
     /**
      * For atomic-mode contexts, perform an atomic AMO (a.k.a., Atomic
      * Read-Modify-Write Memory Operation)

@@ -200,6 +200,34 @@ writeMemTiming(ExecContext *xc, Trace::InstRecord *traceData,
     }
 }
 
+static Fault setMemData(ExecContext *xc, uint64_t mem,
+                        __attribute__((unused)) unsigned dataSize) {
+    mem = htole(mem);
+    return xc->setMemData((uint8_t *)&mem);
+}
+
+template <typename T, size_t N>
+static Fault setPackedMemData(ExecContext *xc, std::array<uint64_t, N> &mem) {
+    std::array<T, N> real_mem;
+    for (int i = 0; i < N; i++)
+        real_mem[i] = mem[i];
+    real_mem = htole(real_mem);
+    return xc->setMemData((uint8_t *)&real_mem);
+}
+
+template <size_t N>
+static Fault setMemData(ExecContext *xc, std::array<uint64_t, N> &mem,
+                        unsigned dataSize) {
+    switch (dataSize) {
+      case 4:
+        return setPackedMemData<uint32_t, N>(xc, mem);
+      case 8:
+        return setPackedMemData<uint64_t, N>(xc, mem);
+      default:
+        panic("Unhandled element size in writeMemTiming.\n");
+    }
+}
+
 static Fault
 writeMemAtomic(ExecContext *xc, Trace::InstRecord *traceData, uint64_t mem,
                unsigned dataSize, Addr addr, Request::Flags flags,

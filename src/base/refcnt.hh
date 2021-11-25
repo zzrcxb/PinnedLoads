@@ -56,7 +56,7 @@
  */
 class RefCounted
 {
-  private:
+  protected:
     // The reference count is mutable because one may want to
     // reference count a const pointer.  This really is OK because
     // const is about logical constness of the object not really about

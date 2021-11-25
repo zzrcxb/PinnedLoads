@@ -293,6 +293,10 @@ class StaticInst : public RefCounted, public StaticInstFlags
         panic("initiateAcc not defined!");
     }
 
+    virtual Fault setStoreData(ExecContext *xc) const {
+        panic("setStoreData not defined!");
+    }
+
     virtual Fault completeAcc(Packet *pkt, ExecContext *xc,
                               Trace::InstRecord *traceData) const
     {

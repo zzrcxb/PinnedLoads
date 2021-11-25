@@ -94,6 +94,8 @@ class BaseO3DynInst : public BaseDynInst<Impl>
     /** Completes the access.  Only valid for memory operations. */
     Fault completeAcc(PacketPtr pkt);
 
+    Fault setStoreData();
+
   private:
     /** Initializes variables. */
     void initVars();
