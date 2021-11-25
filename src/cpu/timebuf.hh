@@ -242,6 +242,11 @@ class TimeBuffer
     {
         return size;
     }
+
+    int getFuture() const
+    {
+        return future;
+    }
 };
 
 #endif // __BASE_TIMEBUF_HH__

@@ -59,6 +59,7 @@ def install_style_hooks(env):
     except Exception as e:
         print("Warning: Failed to find git repo directory: %s" % e)
         return
+    return
 
     git_hooks = gitdir.Dir("hooks")
     def hook_exists(hook_name):

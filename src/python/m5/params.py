@@ -2224,8 +2224,9 @@ class DeprecatedParam(object):
         """
         if not self.message:
             self.message = "See {} for more information".format(simobj_name)
-        warn('{}.{} is deprecated. {}'.format(
-            instance_name, self._oldName, self.message))
+        if 'slave' not in self._oldName and 'master' not in self._oldName:
+            warn('{}.{} is deprecated. {}'.format(
+                instance_name, self._oldName, self.message))
 
 baseEnums = allEnums.copy()
 baseParams = allParams.copy()
