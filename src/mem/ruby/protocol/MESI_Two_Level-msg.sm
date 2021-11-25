@@ -50,10 +50,13 @@ enumeration(CoherenceResponseType, desc="...") {
   DATA_EXCLUSIVE, desc="Data block for L1 cache in M/E state";
   MEMORY_DATA, desc="Data block from / to main memory";
   ACK, desc="Generic invalidate ack";
+  DEFER, desc="invalidation is deferred";
   WB_ACK, desc="writeback ack";
   UNBLOCK, desc="unblock";
+  UNBLOCK_RESET, desc="request is deferred, rollback L2 transaction";
   EXCLUSIVE_UNBLOCK, desc="exclusive unblock";
   INV, desc="Invalidate from directory";
+  CLEAR, desc="Erase the line from CLT";
 }
 
 // RequestMsg
@@ -67,6 +70,7 @@ structure(RequestMsg, desc="...", interface="Message") {
   DataBlock DataBlk,            desc="Data for the cache line (if PUTX)";
   int Len;
   bool Dirty, default="false",  desc="Dirty bit";
+  bool UpdateCLT, default="false", desc="Needs to insert the line in CLT";
   PrefetchBit Prefetch,         desc="Is this a prefetch request";
 
   bool functionalRead(Packet *pkt) {
@@ -95,6 +99,7 @@ structure(ResponseMsg, desc="...", interface="Message") {
   bool Dirty, default="false",  desc="Dirty bit";
   int AckCount, default="0",  desc="number of acks in this message";
   MessageSizeType MessageSize,  desc="size category of the message";
+  bool UpdateCLT, default="false", desc="Needs to insert the line in CLT";
 
   bool functionalRead(Packet *pkt) {
     // Valid data block is only present in message with following types

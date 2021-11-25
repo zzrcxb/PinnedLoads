@@ -72,7 +72,10 @@
 #include "sim/system.hh"
 #include "cpu/o3/isa_specific.hh"
 
+#include "cpu/global_utils.hh"
+
 using namespace std;
+using bridge::GCONFIGS;
 
 template<class Impl>
 DefaultFetch<Impl>::DefaultFetch(O3CPU *_cpu, DerivO3CPUParams *params)
@@ -755,6 +758,7 @@ DefaultFetch<Impl>::doSquash(const TheISA::PCState &newPC,
             delete retryPkt;
         }
         retryPkt = NULL;
+        cacheBlocked = false;
         retryTid = InvalidThreadID;
     }
 
@@ -1073,6 +1077,8 @@ DefaultFetch<Impl>::buildInst(ThreadID tid, StaticInstPtr staticInst,
     // Get a sequence number.
     InstSeqNum seq = cpu->getAndIncrementInstSeq();
 
+    GCONFIGS.youngestSeqNum = seq;
+
     // Create a new DynInst from the instruction fetched.
     DynInstPtr instruction =
         new DynInst(staticInst, curMacroop, thisPC, nextPC, seq, cpu);
@@ -1087,6 +1093,8 @@ DefaultFetch<Impl>::buildInst(ThreadID tid, StaticInstPtr staticInst,
     DPRINTF(Fetch, "[tid:%i] Instruction is: %s\n", tid,
             instruction->staticInst->
             disassemble(thisPC.instAddr()));
+
+    DSTATE(Fetch, instruction);
 
 #if TRACING_ON
     if (trace) {

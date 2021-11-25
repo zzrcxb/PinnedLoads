@@ -148,6 +148,7 @@ enumeration(TransitionResult, desc="...") {
 // RubyRequestType
 enumeration(RubyRequestType, desc="...", default="RubyRequestType_NULL") {
   LD,                desc="Load";
+  SPEC_LD,           desc="Speculative load that can only access L1";
   ST,                desc="Store";
   ATOMIC,            desc="Atomic Load/Store -- depricated. use ATOMIC_RETURN or ATOMIC_NO_RETURN";
   ATOMIC_RETURN,     desc="Atomic Load/Store, return data";
@@ -156,6 +157,7 @@ enumeration(RubyRequestType, desc="...", default="RubyRequestType_NULL") {
   IO,                desc="I/O";
   REPLACEMENT,       desc="Replacement";
   Load_Linked,       desc="";
+  Spec_Load_Linked,  desc="";
   Store_Conditional, desc="";
   RMW_Read,          desc="";
   RMW_Write,         desc="";
@@ -165,8 +167,8 @@ enumeration(RubyRequestType, desc="...", default="RubyRequestType_NULL") {
   NULL,              desc="Invalid request type";
   FLUSH,             desc="Flush request type";
   Release,           desc="Release operation";
-  Acquire,           desc="Acquire opertion";
-  AcquireRelease,    desc="Acquire and Release opertion";
+  Acquire,           desc="Acquire operation";
+  AcquireRelease,    desc="Acquire and Release operation";
   HTM_Start,         desc="hardware memory transaction: begin";
   HTM_Commit,        desc="hardware memory transaction: commit";
   HTM_Cancel,        desc="hardware memory transaction: cancel";

@@ -52,6 +52,7 @@
 #include "enums/SMTQueuePolicy.hh"
 #include "mem/port.hh"
 #include "sim/sim_object.hh"
+#include "cpu/global_utils.hh"
 
 struct DerivO3CPUParams;
 
@@ -258,7 +259,12 @@ class LSQ
             WritebackScheduled  = 0x00001000,
             WritebackDone       = 0x00002000,
             /** True if this is an atomic request */
-            IsAtomic            = 0x00004000
+            IsAtomic            = 0x00004000,
+            IsSpeculative       = 0x00008000,
+            HasSpecL1Miss       = 0x00010000,
+            /** Is the delayed request re-issued */
+            ReIssued            = 0x00020000,
+            EagerTranslated     = 0x00040000
         };
         FlagsType flags;
 
@@ -291,6 +297,8 @@ class LSQ
         std::vector<PacketPtr> _packets;
         std::vector<RequestPtr> _requests;
         std::vector<Fault> _fault;
+        std::vector<bool> _specL1MissStatus;
+        uint32_t _specL1MissCnt = 0;
         uint64_t* _res;
         const Addr _addr;
         const uint32_t _size;
@@ -530,6 +538,13 @@ class LSQ
         bool
         isAnyOutstandingRequest()
         {
+            if (_inst->isSquashed() && _specL1MissCnt &&
+                _numOutstandingPackets == _specL1MissCnt) {
+                // all outstanding packets are missed in L1
+                // no need to retry
+                return false;
+            }
+
             return numInTranslationFragments > 0 ||
                 _numOutstandingPackets > 0 ||
                 (flags.isSet(Flag::WritebackScheduled) &&
@@ -545,6 +560,8 @@ class LSQ
         virtual bool recvTimingResp(PacketPtr pkt) = 0;
         virtual void sendPacketToCache() = 0;
         virtual void buildPackets() = 0;
+
+        virtual void reIssue() = 0;
 
         /**
          * Memory mapped IPR accesses
@@ -688,6 +705,21 @@ class LSQ
             flags.set(Flag::Complete);
         }
 
+        bool isSpeculative() const { return flags.isSet(Flag::IsSpeculative); }
+        void setSpeculative() { flags.set(Flag::IsSpeculative); }
+        void resetSpeculative() { flags.clear(Flag::IsSpeculative); }
+
+        bool hasSpecL1Miss() const { return flags.isSet(Flag::HasSpecL1Miss); }
+        void setSpecL1Miss() { return flags.set(Flag::HasSpecL1Miss); }
+        void resetSpecL1Miss() { return flags.clear(Flag::HasSpecL1Miss); }
+
+        bool isReIssued() const { return flags.isSet(Flag::ReIssued); }
+        void setReIssued() { flags.set(Flag::ReIssued); }
+
+        bool isEagerTranslated() const { return flags.isSet(Flag::EagerTranslated); }
+        void setEagerTranslated() { flags.set(Flag::EagerTranslated); }
+        void resetEagerTranslated() { flags.clear(Flag::EagerTranslated); }
+
         virtual std::string name() const { return "LSQRequest"; }
     };
 
@@ -713,6 +745,7 @@ class LSQ
         using LSQRequest::_state;
         using LSQRequest::flags;
         using LSQRequest::isLoad;
+        using LSQRequest::isSent;
         using LSQRequest::isTranslationComplete;
         using LSQRequest::lsqUnit;
         using LSQRequest::request;
@@ -722,6 +755,17 @@ class LSQ
         using LSQRequest::numTranslatedFragments;
         using LSQRequest::_numOutstandingPackets;
         using LSQRequest::_amo_op;
+        using LSQRequest::_specL1MissStatus;
+        using LSQRequest::_specL1MissCnt;
+        using LSQRequest::reIssue;
+        using LSQRequest::isSpeculative;
+        using LSQRequest::setSpeculative;
+        using LSQRequest::resetSpeculative;
+        using LSQRequest::hasSpecL1Miss;
+        using LSQRequest::setSpecL1Miss;
+        using LSQRequest::resetSpecL1Miss;
+        using LSQRequest::isReIssued;
+        using LSQRequest::setReIssued;
       public:
         SingleDataRequest(LSQUnit* port, const DynInstPtr& inst, bool isLoad,
                           const Addr& addr, const uint32_t& size,
@@ -739,6 +783,9 @@ class LSQ
         virtual bool recvTimingResp(PacketPtr pkt);
         virtual void sendPacketToCache();
         virtual void buildPackets();
+
+        virtual void reIssue();
+
         virtual Cycles handleLocalAccess(ThreadContext *thread, PacketPtr pkt);
         virtual bool isCacheBlockHit(Addr blockAddr, Addr cacheBlockMask);
         virtual std::string name() const { return "SingleDataRequest"; }
@@ -795,6 +842,7 @@ class LSQ
         using LSQRequest::_taskId;
         using LSQRequest::flags;
         using LSQRequest::isLoad;
+        using LSQRequest::isSent;
         using LSQRequest::isTranslationComplete;
         using LSQRequest::lsqUnit;
         using LSQRequest::numInTranslationFragments;
@@ -803,6 +851,17 @@ class LSQ
         using LSQRequest::sendFragmentToTranslation;
         using LSQRequest::setState;
         using LSQRequest::_numOutstandingPackets;
+        using LSQRequest::_specL1MissStatus;
+        using LSQRequest::_specL1MissCnt;
+        using LSQRequest::reIssue;
+        using LSQRequest::isSpeculative;
+        using LSQRequest::setSpeculative;
+        using LSQRequest::resetSpeculative;
+        using LSQRequest::hasSpecL1Miss;
+        using LSQRequest::setSpecL1Miss;
+        using LSQRequest::resetSpecL1Miss;
+        using LSQRequest::isReIssued;
+        using LSQRequest::setReIssued;
 
         uint32_t numFragments;
         uint32_t numReceivedPackets;
@@ -840,6 +899,8 @@ class LSQ
         virtual void initiateTranslation();
         virtual void sendPacketToCache();
         virtual void buildPackets();
+
+        virtual void reIssue();
 
         virtual Cycles handleLocalAccess(ThreadContext *thread, PacketPtr pkt);
         virtual bool isCacheBlockHit(Addr blockAddr, Addr cacheBlockMask);
@@ -1084,10 +1145,34 @@ class LSQ
      */
     Fault write(LSQRequest* req, uint8_t *data, int store_idx);
 
+    Fault setMemData(const DynInstPtr& inst, uint8_t *data) {
+        auto tid = inst->threadNumber;
+        return thread.at(tid).setMemData(inst, data);
+    }
+
     /**
      * Retry the previous send that failed.
      */
     void recvReqRetry();
+
+    void reIssueDelayedReqs() {
+        for (auto &t : thread) {
+            t.reIssueDelayedReqs();
+        }
+    }
+
+    bool markUnSquashables() {
+        for (auto &t : thread) {
+            t.markUnSquashables();
+        }
+        return true;
+    }
+
+    void issueEagerTranslated() {
+        for (auto &t : thread) {
+            t.issueEagerTranslated();
+        }
+    }
 
     void completeDataAccess(PacketPtr pkt);
     /**

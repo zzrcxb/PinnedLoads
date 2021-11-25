@@ -36,8 +36,11 @@
 from __future__ import print_function
 from __future__ import absolute_import
 
+import os
+
 from m5 import fatal
 import m5.objects
+from m5.objects import *
 
 def config_etrace(cpu_cls, cpu_list, options):
     if issubclass(cpu_cls, m5.objects.DerivO3CPU):
@@ -56,9 +59,49 @@ def config_etrace(cpu_cls, cpu_list, options):
             # limitation as such stalls will get captured in the trace
             # as compute delay. For replay, ROB, LQ and SQ sizes are
             # modelled in the Trace CPU.
-            cpu.numROBEntries = 512;
-            cpu.LQEntries = 128;
-            cpu.SQEntries = 128;
+            cpu.numROBEntries = 512
+            cpu.LQEntries = 128
+            cpu.SQEntries = 128
     else:
         fatal("%s does not support data dependency tracing. Use a CPU model of"
               " type or inherited from DerivO3CPU.", cpu_cls)
+
+
+def config_O3CPU(cpu_cls, cpu_list, options):
+    if not issubclass(cpu_cls, m5.objects.DerivO3CPU):
+        return
+
+    for cpu in cpu_list:
+        cpu.maxInsts = options.maxinsts if options.maxinsts else 0
+        cpu.maxTicks = options.rel_max_tick if options.rel_max_tick else 0
+        cpu.HWName = options.hw
+        cpu.threatModelName = options.threat_model
+        cpu.needsTSO = options.needsTSO
+        cpu.delayInvAck = options.delay_inv_ack
+        cpu.delayWB = options.delay_wb
+        if cpu.delayInvAck:
+            assert(cpu.needsTSO)
+
+        cpu.L1DSize  = MemorySize(options.l1d_size)
+        cpu.L1DAssoc = options.l1d_assoc
+        cpu.L2Size   = MemorySize(options.l2_size)
+        cpu.L2Assoc  = options.l2_assoc
+        cpu.numL2    = options.num_l2caches
+        cpu.L2VPartition     = options.l2_vpartition
+        cpu.eagerTranslation = options.eager_translation
+        cpu.cachelineSize    = options.cacheline_size
+
+        def parse_cst_config(cs):
+            entry, record = cs.replace('x', 'X').split('X')
+            return int(entry), int(record)
+
+        cpu.L1DCSTEntryCnt, cpu.L1DCSTRecordCnt = parse_cst_config(options.l1d_cst)
+        cpu.L2CSTEntryCnt, cpu.L2CSTRecordCnt = parse_cst_config(options.l2_cst)
+        cpu.entryUseCAM = options.entry_cam
+        cpu.CLTSize = options.clt_size
+        cpu.CSTRecord = options.cst_record
+
+        cpu.collectPerfStats = options.perf_counter
+        cpu.lowerSeqNum = options.dstate_start
+        cpu.upperSeqNum = options.dstate_end
+        cpu.specBreakdown = options.spec_breakdown

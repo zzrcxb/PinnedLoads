@@ -49,6 +49,8 @@
 #include <list>
 #include <string>
 
+#include "base/trace.hh"
+#include "base/logging.hh"
 #include "arch/generic/tlb.hh"
 #include "arch/utility.hh"
 #include "base/trace.hh"
@@ -66,6 +68,72 @@
 #include "mem/request.hh"
 #include "sim/byteswap.hh"
 #include "sim/system.hh"
+
+#include "cpu/global_utils.hh"
+#include "cpu/o3/perf_counter.hh"
+#include "debug/Tracer.hh"
+#include "debug/MemDbg.hh"
+#include "debug/DEV.hh"
+
+extern PerfCounter PERF_CNT;
+
+#define RESET_STATUS_D(NAME) \
+    void reset##NAME() { if (status[NAME]) { status.reset(NAME); } }
+
+#define RESET_STATUS_DP(NAME)          \
+    void reset##NAME() {               \
+        if (status[NAME]) {            \
+            DSTATE(reset##NAME, this); \
+            status.reset(NAME);        \
+        }                              \
+    }
+
+#define SET_STATUS_D(NAME) \
+    void set##NAME() { if (!status[NAME]) status.set(NAME); }
+
+#define SET_STATUS_DP(NAME)          \
+    void set##NAME() {               \
+        if (!status[NAME]) {         \
+            DSTATE(set##NAME, this); \
+            status.set(NAME);        \
+        }                            \
+    }
+
+#define IS_STATUS_D(NAME) \
+    bool is##NAME() const { return status[NAME]; }
+
+#define HAS_STATUS_D(NAME) \
+    bool has##NAME() const { return status[NAME]; }
+
+#define RESET_FLAG_D(NAME) \
+    void reset##NAME() { if (status[NAME]) status[NAME] = false; }
+
+#define RESET_FLAG_DP(NAME)            \
+    void reset##NAME() {               \
+        if (status[NAME]) {            \
+            DSTATE(reset##NAME, this); \
+            status[NAME] = false;      \
+        }                              \
+    }
+
+#define SET_FLAG_D(NAME) \
+    void set##NAME() { if (!status[NAME]) status[NAME] = true; }
+
+#define SET_FLAG_DP(NAME)            \
+    void set##NAME() {               \
+        if (!status[NAME]) {         \
+            DSTATE(set##NAME, this); \
+            status[NAME] = true;     \
+        }                            \
+    }
+
+#define IS_FLAG_D(NAME) \
+    bool is##NAME() const { return status[NAME]; }
+
+#define HAS_FLAG_D(NAME) \
+    bool has##NAME() const { return status[NAME]; }
+
+using bridge::GCONFIGS;
 
 /**
  * @file
@@ -120,10 +188,30 @@ class BaseDynInst : public ExecContext, public RefCounted
         RecoverInst,             /// Is a recover instruction
         BlockingInst,            /// Is a blocking instruction
         ThreadsyncWait,          /// Is a thread synchronization instruction
-        SerializeBefore,         /// Needs to serialize on
-                                 /// instructions ahead of it
+        SerializeBefore,         /// Needs to serialize on instructions ahead of it
         SerializeAfter,          /// Needs to serialize instructions behind it
         SerializeHandled,        /// Serialization has been handled
+        DataReceived,            /// Has the load received data
+        Speculative,             /// Speculative when decoding
+        UnderExcept,             /// Under the shadow of potential excepting instructions
+        ReachedVP,               /// Has reached VP?
+        ReachedESP,              /// Has reached ESP?
+        ReachedOSP,              /// Has reached OSP
+        Protected,               /// Protected by the secure schemes
+        Golden,                  /// Will reaches ESP & VP immediately, for Dbg purpose only
+        UnSquashable,            /// It is un-squashable
+        PendingUnlockReq,        /// The instruction has pending unlock requests
+        PendingWB,               /// The instruction has pending WB
+        WBBlocked,               /// WB is blocked due to limited TimeBuffer
+        NotMemAddr,              /// The instruction accessed a non-mem address
+        MemViolation,            /// Has memory violation
+        SpecL1Hit,               /// Speculative L1 hit
+        EagerIssued,             /// It is eagerly issued
+        EagerTranslated,         /// Started translation before data is available
+        ArgsTainted,             /// Args are tainted by transiently read data
+        DestTainted,             /// Dest is tainted by transiently read data
+        RoT,                     /// It is the Root of Taint  (i.e., source)
+        HasConflict,
         NumStatus
     };
 
@@ -165,6 +253,10 @@ class BaseDynInst : public ExecContext, public RefCounted
 
     /** InstRecord that tracks this instructions. */
     Trace::InstRecord *traceData;
+
+    ContextID getContextId() {
+        return cpu->thread[threadNumber]->contextId();
+    }
 
   protected:
     /** The result of the instruction; assumes an instruction can have many
@@ -317,12 +409,19 @@ class BaseDynInst : public ExecContext, public RefCounted
                    const std::vector<bool> &byte_enable=std::vector<bool>())
                    override;
 
+    Fault setMemData(uint8_t *data) override;
+
     Fault initiateMemAMO(Addr addr, unsigned size, Request::Flags flags,
                          AtomicOpFunctorPtr amo_op) override;
 
     /** True if the DTB address translation has started. */
     bool translationStarted() const { return instFlags[TranslationStarted]; }
-    void translationStarted(bool f) { instFlags[TranslationStarted] = f; }
+    void translationStarted(bool f) {
+        if (f) {
+            DSTATE(TranslationStarted, this);
+        }
+        instFlags[TranslationStarted] = f;
+    }
 
     /** True if the DTB address translation has completed. */
     bool translationCompleted() const { return instFlags[TranslationCompleted]; }
@@ -362,9 +461,7 @@ class BaseDynInst : public ExecContext, public RefCounted
     }
 
   public:
-#ifdef DEBUG
     void dumpSNList();
-#endif
 
     /** Returns the physical register index of the i'th destination
      *  register.
@@ -573,6 +670,82 @@ class BaseDynInst : public ExecContext, public RefCounted
     bool isHtmStop() const { return staticInst->isHtmStop(); }
     bool isHtmCancel() const { return staticInst->isHtmCancel(); }
     bool isHtmCmd() const { return staticInst->isHtmCmd(); }
+
+    bool isDiv() const { return opClass() == IntDivOp || opClass() == FloatDivOp; }
+
+    /* is this (dyn./static) instruction capable of causing an exception.
+     * this is a static attrib that is only related to instruction type */
+    bool isExcepting() const {
+        return isSquashAfter() || isMemRef() || isDiv() || isSyscall();
+    }
+
+    /* at a certain time stamp, is this dynamic instruction
+     * free from exceptions. Note that, this is a dynamic attrib */
+    bool isExceptionFree() const {
+        if (GCONFIGS.specBreakdown < utils::EXCEPTION) {
+            return true;
+        }
+
+        if (isSquashAfter()) {
+            return false;
+        } else if (isMemRef()) {
+            return effAddrValid() && isReachedESP() && getFault() == NoFault;
+        } else if (isDiv()) {
+            return isExecuted() && isReachedESP() && getFault() == NoFault;
+        } else if (isSyscall()) {
+            return false;
+        } else {
+            return getFault() == NoFault;
+        }
+    }
+
+    // STT: whether it can be used as an access instruction
+    bool canBeAccess() const {
+        return isLoad() && !isDataPrefetch();
+    }
+
+    bool isTransmitter() const {
+        switch (GCONFIGS.threatModel) {
+            case utils::Unsafe:
+                return false;
+            case utils::Spectre:
+            case utils::Comprehensive:
+                return isLoad();
+            default:
+                panic("Invalid threat model!");
+        }
+    }
+
+    bool isSquashing() const {
+        return isSquash;
+    }
+
+    bool isWBDelayable() const {
+        return !(isControl() || numDestRegs() == 0);
+    }
+
+    bool canEagerTranslation() const {
+        if (GCONFIGS.eagerTranslation) {
+            switch (GCONFIGS.ISA) {
+            case utils::X86:
+                return isStore() && numSrcRegs() == 4 && readyRegs == 3 &&
+                    !isReadySrcRegIdx(2) && !isEagerIssued();
+            case utils::ARM:
+                return false;
+            }
+            return false;
+        } else {
+            return false;
+        }
+    }
+
+    bool isFPLoad() const {
+        return isLoad() && (isFloating() || isVector()) && numIntDestRegs() == 0;
+    }
+
+    bool isFP2Int() const {
+        return (isFloating() || isVector()) && numIntDestRegs() > 0;
+    }
 
     uint64_t
     getHtmTransactionUid() const override
@@ -824,10 +997,17 @@ class BaseDynInst : public ExecContext, public RefCounted
     bool isResultReady() const { return status[ResultReady]; }
 
     /** Sets this instruction as ready to issue. */
-    void setCanIssue() { status.set(CanIssue); }
+    void setCanIssue() {
+        status.set(CanIssue);
+        operandsReadyTick = curTick();
+        if (GCONFIGS.hw == utils::STT && canBeAccess() && !isReachedVP()) {
+            setDestTainted();
+            setRoT();
+        }
+    }
 
     /** Returns whether or not this instruction is ready to issue. */
-    bool readyToIssue() const { return status[CanIssue]; }
+    bool readyToIssue() const { return status[CanIssue] || canEagerTranslation(); }
 
     /** Clears this instruction being able to issue. */
     void clearCanIssue() { status.reset(CanIssue); }
@@ -842,7 +1022,11 @@ class BaseDynInst : public ExecContext, public RefCounted
     void clearIssued() { status.reset(Issued); }
 
     /** Sets this instruction as executed. */
-    void setExecuted() { status.set(Executed); }
+    void setExecuted() {
+        DSTATE(Executed, this);
+        status.set(Executed);
+        resultsReadyTick = curTick();
+    }
 
     /** Returns whether or not this instruction has executed. */
     bool isExecuted() const { return status[Executed]; }
@@ -854,14 +1038,22 @@ class BaseDynInst : public ExecContext, public RefCounted
     void clearCanCommit() { status.reset(CanCommit); }
 
     /** Returns whether or not this instruction is ready to commit. */
-    bool readyToCommit() const { return status[CanCommit]; }
+    bool readyToCommit() const { return status[CanCommit] &&
+                                        !hasPendingUnlockReq() &&
+                                        !hasPendingWB(); }
 
     void setAtCommit() { status.set(AtCommit); }
 
     bool isAtCommit() { return status[AtCommit]; }
 
     /** Sets this instruction as committed. */
-    void setCommitted() { status.set(Committed); }
+    void setCommitted() {
+        status.set(Committed);
+        if (GCONFIGS.collectPerfStats && (isSquashing() || isTransmitter())) {
+            updatePerfCounter();
+        }
+        YRoT = nullptr;
+    }
 
     /** Returns whether or not this instruction is committed. */
     bool isCommitted() const { return status[Committed]; }
@@ -958,6 +1150,146 @@ class BaseDynInst : public ExecContext, public RefCounted
     setPinnedRegsSquashDone() {
         assert(!status[PinnedRegsSquashDone]);
         status.set(PinnedRegsSquashDone);
+    }
+
+    SET_STATUS_DP(DataReceived);
+    IS_STATUS_D(DataReceived);
+
+    SET_STATUS_DP(Speculative);
+    IS_STATUS_D(Speculative);
+
+    void setReachedVP() {
+        if (status[ReachedVP]) return;
+
+        status.set(ReachedVP);
+        DSTATE(setReachedVP, this);
+
+        if (!isReachedESP()) setReachedESP();
+        if (isDestTainted()) {
+            resetDestTainted();
+        }
+    }
+
+    IS_STATUS_D(ReachedVP);
+
+    void setReachedESP() {
+        if (status[ReachedESP]) return;
+
+        status.set(ReachedESP);
+        DSTATE(setReachedESP, this);
+        if (operandsReadyTick) {
+            ESPDelayedCycles = (curTick() - operandsReadyTick) / bridge::TICKS_PER_CYCLE;
+        }
+    }
+    IS_STATUS_D(ReachedESP);
+    RESET_STATUS_DP(ReachedESP);
+
+    void setReachedOSP() {
+        if (status[ReachedOSP]) return;
+
+        status.set(ReachedOSP);
+        DSTATE(setReachedOSP, this);
+        if (resultsReadyTick) {
+            OSPDelayedCycles = (curTick() - resultsReadyTick) / bridge::TICKS_PER_CYCLE;
+        }
+    }
+    IS_STATUS_D(ReachedOSP);
+    RESET_STATUS_DP(ReachedOSP);
+
+    SET_STATUS_DP(Protected);
+    IS_STATUS_D(Protected);
+
+    SET_STATUS_DP(Golden);
+    IS_STATUS_D(Golden);
+
+    void setUnSquashable() {
+        if (status[UnSquashable]) return;
+
+        status.set(UnSquashable);
+        DSTATE(UnSquashable, this);
+        if (!isReachedOSP()) {
+            setReachedOSP();
+            cpu->earlyOSPDueToDelayAck++;
+        }
+    }
+    IS_STATUS_D(UnSquashable);
+
+
+    SET_STATUS_DP(PendingUnlockReq);
+    RESET_STATUS_DP(PendingUnlockReq);
+    HAS_STATUS_D(PendingUnlockReq);
+
+    SET_STATUS_DP(PendingWB);
+    RESET_STATUS_DP(PendingWB);
+    HAS_STATUS_D(PendingWB);
+
+    SET_STATUS_DP(WBBlocked);
+    RESET_STATUS_DP(WBBlocked);
+    IS_STATUS_D(WBBlocked);
+
+    SET_STATUS_DP(UnderExcept);
+    RESET_STATUS_DP(UnderExcept);
+    bool isUnderExcept() const {
+        return status[UnderExcept] || !isExceptionFree();
+    }
+
+    SET_STATUS_DP(NotMemAddr);
+    IS_STATUS_D(NotMemAddr);
+
+    SET_STATUS_DP(MemViolation);
+    HAS_STATUS_D(MemViolation);
+
+    SET_STATUS_DP(SpecL1Hit);
+    IS_STATUS_D(SpecL1Hit);
+
+    SET_STATUS_DP(EagerTranslated);
+    IS_STATUS_D(EagerTranslated);
+    RESET_STATUS_DP(EagerTranslated);
+
+    SET_STATUS_DP(EagerIssued);
+    IS_STATUS_D(EagerIssued);
+    RESET_STATUS_DP(EagerIssued);
+
+    SET_STATUS_DP(ArgsTainted);
+    IS_STATUS_D(ArgsTainted);
+    RESET_STATUS_DP(ArgsTainted);
+
+    SET_STATUS_DP(DestTainted);
+    IS_STATUS_D(DestTainted);
+    RESET_STATUS_DP(DestTainted);
+
+    SET_STATUS_DP(HasConflict);
+    IS_STATUS_D(HasConflict);
+    RESET_STATUS_DP(HasConflict);
+
+    SET_STATUS_DP(RoT);
+    IS_STATUS_D(RoT);
+
+    void setYRoT(DynInstPtr inst) {
+        DynInstPtr &rot = inst->isRoT() ? inst : inst->YRoT;
+        if (rot && !rot->isDestTainted()) {
+            return;
+        }
+
+        if (!YRoT || rot->seqNum > YRoT->seqNum) {
+            YRoT = rot;
+            CSPRINT(TaintPropagate, this, " from %#x+%lli(%c)@%lli: YRoT: %#x+%lli(%c)@%lli\n",
+                    inst->instAddr(), inst->microPC(), inst->typeCode, inst->seqNum,
+                    YRoT->instAddr(), YRoT->microPC(), YRoT->typeCode, YRoT->seqNum);
+        }
+
+        if (YRoT && !isArgsTainted()) {
+            setArgsTainted();
+            if (!isTransmitter()) {
+                setDestTainted();
+            }
+        }
+    }
+
+    void updatePerfCounter() {
+        PERF_CNT.update(getContextId(), instAddr(), microPC(),
+                        typeCode, !isSquashed(), ESPDelayedCycles,
+                        OSPDelayedCycles);
     }
 
     /** Read the PC state of this instruction. */
@@ -1064,6 +1396,32 @@ class BaseDynInst : public ExecContext, public RefCounted
     {
         return cpu->getCpuAddrMonitor(threadNumber);
     }
+
+    /// Increment the reference count
+    void incref() const {
+        ++count;
+    }
+
+    /// Decrement the reference count and destroy the object if all
+    /// references are gone.
+    void decref() const {
+        if (--count <= 0)
+            delete this;
+    }
+
+  public:
+    DynInstPtr YRoT = nullptr;
+    char typeCode;
+
+    int32_t l1_set = -1, l2_slice = -1, l2_set = -1;
+    uint64_t line_accessed = 0;
+
+  private:
+    bool isSquash = false;
+
+    // a collection of perf stats
+    uint64_t ESPDelayedCycles = 0, OSPDelayedCycles = 0;
+    uint64_t operandsReadyTick = 0, resultsReadyTick = 0;
 };
 
 template<class Impl>
@@ -1099,6 +1457,16 @@ BaseDynInst<Impl>::writeMem(uint8_t *data, unsigned size, Addr addr,
             dynamic_cast<typename DynInstPtr::PtrType>(this),
             /* st */ false, data, size, addr, flags, res, nullptr,
             byte_enable);
+}
+
+template<class Impl>
+Fault
+BaseDynInst<Impl>::setMemData(uint8_t *data) {
+    assert(isEagerTranslated());
+    assert(isEagerIssued());
+    resetEagerTranslated();
+    resetEagerIssued();
+    return cpu->setMemData(dynamic_cast<typename DynInstPtr::PtrType>(this), data);
 }
 
 template<class Impl>

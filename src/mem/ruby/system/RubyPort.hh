@@ -52,6 +52,7 @@
 #include "mem/tport.hh"
 #include "params/RubyPort.hh"
 #include "sim/clocked_object.hh"
+#include "debug/RubyTracer.hh"
 
 class AbstractController;
 
@@ -174,6 +175,7 @@ class RubyPort : public ClockedObject
     void ruby_hit_callback(PacketPtr pkt);
     void testDrainComplete();
     void ruby_eviction_callback(Addr address);
+    void ruby_updateCLT(Addr address, bool insert, bool external);
 
     /**
      * Called by the PIO port when receiving a timing response.

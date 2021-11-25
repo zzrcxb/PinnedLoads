@@ -50,6 +50,8 @@
 #include "debug/ProtocolTrace.hh"
 #include "debug/RubySequencer.hh"
 #include "debug/RubyStats.hh"
+#include "debug/RubyTracer.hh"
+#include "debug/NSR.hh"
 #include "mem/packet.hh"
 #include "mem/ruby/profiler/Profiler.hh"
 #include "mem/ruby/protocol/PrefetchBit.hh"
@@ -60,6 +62,7 @@
 #include "sim/system.hh"
 
 using namespace std;
+using bridge::GCONFIGS;
 
 Sequencer *
 RubySequencerParams::create()
@@ -172,7 +175,55 @@ Sequencer::wakeup()
                 continue;
 
             panic("Possible Deadlock detected. Aborting!\n version: %d "
-                  "request.paddr: 0x%x m_readRequestTable: %d current time: "
+                  "request.paddr: 0x%x m_RequestTable: %d current time: "
+                  "%u issue_time: %d difference: %d\n", m_version,
+                  seq_req.pkt->getAddr(), table_entry.second.size(),
+                  current_time * clockPeriod(), seq_req.issue_time
+                  * clockPeriod(), (current_time * clockPeriod())
+                  - (seq_req.issue_time * clockPeriod()));
+        }
+        total_outstanding += table_entry.second.size();
+    }
+
+    for (const auto &table_entry : s_RequestTable) {
+        for (const auto seq_req : table_entry.second) {
+            if (current_time - seq_req.issue_time < m_deadlock_threshold)
+                continue;
+
+            panic("Possible Deadlock detected. Aborting!\n version: %d "
+                  "request.paddr: 0x%x s_RequestTable: %d current time: "
+                  "%u issue_time: %d difference: %d\n", m_version,
+                  seq_req.pkt->getAddr(), table_entry.second.size(),
+                  current_time * clockPeriod(), seq_req.issue_time
+                  * clockPeriod(), (current_time * clockPeriod())
+                  - (seq_req.issue_time * clockPeriod()));
+        }
+        total_outstanding += table_entry.second.size();
+    }
+
+    for (const auto &table_entry : l_RequestTable) {
+        for (const auto seq_req : table_entry.second) {
+            if (current_time - seq_req.issue_time < m_deadlock_threshold)
+                continue;
+
+            panic("Possible Deadlock detected. Aborting!\n version: %d "
+                  "request.paddr: 0x%x l_RequestTable: %d current time: "
+                  "%u issue_time: %d difference: %d\n", m_version,
+                  seq_req.pkt->getAddr(), table_entry.second.size(),
+                  current_time * clockPeriod(), seq_req.issue_time
+                  * clockPeriod(), (current_time * clockPeriod())
+                  - (seq_req.issue_time * clockPeriod()));
+        }
+        total_outstanding += table_entry.second.size();
+    }
+
+    for (const auto &table_entry : w_RequestTable) {
+        for (const auto seq_req : table_entry.second) {
+            if (current_time - seq_req.issue_time < m_deadlock_threshold)
+                continue;
+
+            panic("Possible Deadlock detected. Aborting!\n version: %d "
+                  "request.paddr: 0x%x w_RequestTable: %d current time: "
                   "%u issue_time: %d difference: %d\n", m_version,
                   seq_req.pkt->getAddr(), table_entry.second.size(),
                   current_time * clockPeriod(), seq_req.issue_time
@@ -247,15 +298,65 @@ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
     }
 
     Addr line_addr = makeLineAddress(pkt->getAddr());
+
+    bool use_spec_list = secondary_type == RubyRequestType_SPEC_LD;
+
+    // TODO: remove write list
+    bool use_write_list = primary_type == RubyRequestType_ST &&
+                          secondary_type == RubyRequestType_ST &&
+                          GCONFIGS.delayInvAck;
+    use_write_list = false;
+    bool use_lock_list = secondary_type == RubyRequestType_IFETCH &&
+                         GCONFIGS.delayInvAck && isUnSquashable(line_addr) &&
+                         (!IN_MAP(line_addr, m_RequestTable) ||
+                          m_RequestTable.at(line_addr).size() == 0);
+
+    assert(!use_spec_list || !use_write_list);
+    assert(!use_spec_list || !use_lock_list);
+    assert(!use_write_list || !use_lock_list);
+    assert(!use_spec_list || (use_spec_list && GCONFIGS.hw == utils::DOM));
     // Check if there is any outstanding request for the same cache line.
-    auto &seq_req_list = m_RequestTable[line_addr];
+    if (use_spec_list && IN_MAP(line_addr, m_RequestTable) &&
+        m_RequestTable[line_addr].size() > 0) {
+        use_spec_list = false;
+    }
+
+
+    if (pkt->isRead() || pkt->isWrite()) {
+        // debug information
+        DPRINTF(RubyTracer, "insert req %#x, spec: %d, write: %d, lock: %d\n",
+                pkt->getAddr(), use_spec_list, use_write_list, use_lock_list);
+    }
+
+    list<SequencerRequest> *seq_req_list;
+    if (use_spec_list) {
+        seq_req_list = &s_RequestTable[line_addr];
+    } else if (use_write_list) {
+        seq_req_list = &w_RequestTable[line_addr];
+    } else if (use_lock_list) {
+        seq_req_list = &l_RequestTable[line_addr];
+    } else {
+        seq_req_list = &m_RequestTable[line_addr];
+    }
+
+    if (GCONFIGS.delayInvAck && secondary_type == RubyRequestType_ST) {
+        updateCLT(line_addr, true, true);
+    }
+
     // Create a default entry
-    seq_req_list.emplace_back(pkt, primary_type,
-        secondary_type, curCycle());
+    seq_req_list->emplace_back(pkt, primary_type, secondary_type, curCycle());
     m_outstanding_count++;
 
-    if (seq_req_list.size() > 1) {
+    if (pkt->isSpeculative()) {
+        pkt->setSpecReqSent();
+    }
+
+    if (seq_req_list->size() > 1) {
         return RequestStatus_Aliased;
+    }
+
+    if (use_spec_list) {
+        specRubyReadCnt++;
     }
 
     m_outstandReqHist.sample(m_outstanding_count);
@@ -354,8 +455,26 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
     // to this cache line when response for the write comes back
     //
     assert(address == makeLineAddress(address));
-    assert(m_RequestTable.find(address) != m_RequestTable.end());
+
+    // bool use_write_list = false;
+    // if (use_write_list && IN_MAP(address, w_RequestTable) &&
+    //     w_RequestTable.at(address).size() > 0) {
+    //     assert(IN_MAP(address, w_RequestTable));
+    // } else {
+    //     use_write_list = false;
+    //     assert(IN_MAP(address, m_RequestTable));
+    // }
+    assert(IN_MAP(address, m_RequestTable));
     auto &seq_req_list = m_RequestTable[address];
+
+    updateCLT(address, false, true);
+
+    if (IN_SET(address, preLockBuffer)) {
+        DPRINTF(RubyTracer, "Pre-locked line %#x presents due to write\n",
+                address);
+        bool _locked = setUnSquashable(address, false);
+        assert(_locked);
+    }
 
     // Perform hitCallback on every cpu request made to this cache block while
     // ruby request was outstanding. Since only 1 ruby request was made,
@@ -367,13 +486,17 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
         SequencerRequest &seq_req = seq_req_list.front();
         if (ruby_request) {
             assert(seq_req.m_type != RubyRequestType_LD);
+            assert(seq_req.m_type != RubyRequestType_SPEC_LD);
             assert(seq_req.m_type != RubyRequestType_Load_Linked);
+            assert(seq_req.m_type != RubyRequestType_Spec_Load_Linked);
             assert(seq_req.m_type != RubyRequestType_IFETCH);
         }
 
         // handle write request
         if ((seq_req.m_type != RubyRequestType_LD) &&
+            (seq_req.m_type != RubyRequestType_SPEC_LD) &&
             (seq_req.m_type != RubyRequestType_Load_Linked) &&
+            (seq_req.m_type != RubyRequestType_Spec_Load_Linked) &&
             (seq_req.m_type != RubyRequestType_IFETCH)) {
             // LL/SC support (tested with ARMv8)
             bool success = true;
@@ -431,7 +554,11 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
 
     // free all outstanding requests corresponding to this address
     if (seq_req_list.empty()) {
+        // if (use_write_list) {
+        //     w_RequestTable.erase(address);
+        // } else {
         m_RequestTable.erase(address);
+        // }
     }
 }
 
@@ -447,8 +574,37 @@ Sequencer::readCallback(Addr address, DataBlock& data,
     // or end of the corresponding list.
     //
     assert(address == makeLineAddress(address));
-    assert(m_RequestTable.find(address) != m_RequestTable.end());
-    auto &seq_req_list = m_RequestTable[address];
+
+    // determine which L1 replied the data
+    AbstractCacheEntry *I_line = m_instCache_ptr->lookup(address);
+    bool use_l_buffer = false;
+    if (I_line) {
+        if (!IN_MAP(address, m_RequestTable) ||
+            m_RequestTable.at(address).empty() ||
+            m_RequestTable.at(address).front().m_type != RubyRequestType_IFETCH) {
+            assert(IN_MAP(address, l_RequestTable));
+            assert(l_RequestTable.at(address).front().m_second_type ==
+                   RubyRequestType_IFETCH);
+            use_l_buffer = true;
+        } else {
+            assert(IN_MAP(address, m_RequestTable));
+            use_l_buffer = false;
+        }
+    } else {
+        assert(IN_MAP(address, m_RequestTable));
+        use_l_buffer = false;
+    }
+
+    auto &seq_req_list = use_l_buffer ? l_RequestTable[address] :
+                                        m_RequestTable[address];
+
+    if (IN_SET(address, preLockBuffer) &&
+        seq_req_list.front().m_type != RubyRequestType_IFETCH) {
+        DPRINTF(RubyTracer, "Pre-locked line %#x presents due to read\n",
+                address);
+        bool _locked = setUnSquashable(address, false);
+        assert(_locked);
+    }
 
     // Perform hitCallback on every cpu request made to this cache block while
     // ruby request was outstanding. Since only 1 ruby request was made,
@@ -465,9 +621,12 @@ Sequencer::readCallback(Addr address, DataBlock& data,
             aliased_loads++;
         }
         if ((seq_req.m_type != RubyRequestType_LD) &&
+            (seq_req.m_type != RubyRequestType_SPEC_LD) &&
             (seq_req.m_type != RubyRequestType_Load_Linked) &&
+            (seq_req.m_type != RubyRequestType_Spec_Load_Linked) &&
             (seq_req.m_type != RubyRequestType_IFETCH)) {
             // Write request: reissue request to the cache hierarchy
+            updateCLT(seq_req.pkt->getAddr(), true, true);
             issueRequest(seq_req.pkt, seq_req.m_second_type);
             break;
         }
@@ -486,7 +645,81 @@ Sequencer::readCallback(Addr address, DataBlock& data,
 
     // free all outstanding requests corresponding to this address
     if (seq_req_list.empty()) {
-        m_RequestTable.erase(address);
+        if (use_l_buffer) {
+            l_RequestTable.erase(address);
+        } else {
+            m_RequestTable.erase(address);
+        }
+    }
+}
+
+/**
+ * If speculative read misses in L1
+ */
+void
+Sequencer::specReadCallback(Addr address) {
+    auto db = new DataBlock;
+    specReadCallback(address, *db, true, false, MachineType_NUM,
+                     Cycles(0), Cycles(0), Cycles(0));
+    delete db;
+}
+
+void
+Sequencer::specReadCallback(Addr address, DataBlock& data,
+                      const bool specMiss, const bool externalHit,
+                      const MachineType mach, const Cycles initialRequestTime,
+                      const Cycles forwardRequestTime,
+                      const Cycles firstResponseTime) {
+    assert(address == makeLineAddress(address));
+    assert(s_RequestTable.find(address) != s_RequestTable.end());
+    auto &seq_req_list = s_RequestTable[address];
+
+    if (!specMiss && IN_SET(address, preLockBuffer)) {
+        DPRINTF(RubyTracer, "Pre-locked line %#x presents due to spec read\n",
+                address);
+        bool _locked = setUnSquashable(address, false);
+        assert(_locked);
+    }
+
+    // Perform hitCallback on every cpu request made to this cache block while
+    // ruby request was outstanding. Since only 1 ruby request was made,
+    // profile the ruby latency once.
+    bool ruby_request = true;
+    int aliased_loads = 0;
+    while (!seq_req_list.empty()) {
+        SequencerRequest &seq_req = seq_req_list.front();
+        if (ruby_request) {
+            assert((seq_req.m_type == RubyRequestType_SPEC_LD) ||
+                   (seq_req.m_type == RubyRequestType_Spec_Load_Linked));
+        } else {
+            aliased_loads++;
+        }
+
+        if (seq_req.m_type != RubyRequestType_SPEC_LD &&
+            seq_req.m_type != RubyRequestType_Spec_Load_Linked) {
+            // Write request: reissue request to the cache hierarchy
+            panic("s_RequestTable should only contain SPEC_LD or SPEC_LL");
+        }
+        if (ruby_request) {
+            recordMissLatency(&seq_req, true, mach, externalHit,
+                              initialRequestTime, forwardRequestTime,
+                              firstResponseTime);
+        }
+        hitCallback(&seq_req, data, true, mach, externalHit,
+                    initialRequestTime, forwardRequestTime,
+                    firstResponseTime, specMiss);
+        seq_req_list.pop_front();
+        markRemoved();
+        ruby_request = false;
+    }
+
+    // free all outstanding requests corresponding to this address
+    if (seq_req_list.empty()) {
+        s_RequestTable.erase(address);
+    }
+
+    if (specMiss) {
+        specL1MissCnt++;
     }
 }
 
@@ -496,7 +729,8 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
                        const MachineType mach, const bool externalHit,
                        const Cycles initialRequestTime,
                        const Cycles forwardRequestTime,
-                       const Cycles firstResponseTime)
+                       const Cycles firstResponseTime,
+                       const bool specL1Miss)
 {
     warn_once("Replacement policy updates recently became the responsibility "
               "of SLICC state machines. Make sure to setMRU() near callbacks "
@@ -507,23 +741,32 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
     RubyRequestType type = srequest->m_type;
 
     // Load-linked handling
-    if (type == RubyRequestType_Load_Linked) {
+    if (type == RubyRequestType_Load_Linked ||
+        (type == RubyRequestType_Spec_Load_Linked && !specL1Miss)) {
         Addr line_addr = makeLineAddress(request_address);
         llscLoadLinked(line_addr);
     }
 
-    // update the data unless it is a non-data-carrying flush
-    if (RubySystem::getWarmupEnabled()) {
+    if (specL1Miss) {
+        assert(type == RubyRequestType_SPEC_LD ||
+               type == RubyRequestType_Spec_Load_Linked);
+    } else if (RubySystem::getWarmupEnabled()) {
+        // update the data unless it is a non-data-carrying flush
         data.setData(pkt->getConstPtr<uint8_t>(),
                      getOffset(request_address), pkt->getSize());
     } else if (!pkt->isFlush()) {
         if ((type == RubyRequestType_LD) ||
+            (type == RubyRequestType_SPEC_LD) ||
             (type == RubyRequestType_IFETCH) ||
             (type == RubyRequestType_RMW_Read) ||
             (type == RubyRequestType_Locked_RMW_Read) ||
-            (type == RubyRequestType_Load_Linked)) {
+            (type == RubyRequestType_Load_Linked) ||
+            (type == RubyRequestType_Spec_Load_Linked)) {
             pkt->setData(
                 data.getData(getOffset(request_address), pkt->getSize()));
+            if (type == RubyRequestType_SPEC_LD) {
+                pkt->setSpecL1Hit();
+            }
             DPRINTF(RubySequencer, "read data %s\n", data);
         } else if (pkt->req->isSwap()) {
             std::vector<uint8_t> overwrite_val(pkt->getSize());
@@ -571,12 +814,27 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
 bool
 Sequencer::empty() const
 {
-    return m_RequestTable.empty();
+    return m_RequestTable.empty() && s_RequestTable.empty() &&
+           l_RequestTable.empty() && w_RequestTable.empty();
 }
 
 RequestStatus
 Sequencer::makeRequest(PacketPtr pkt)
 {
+    if (pkt->isSetUnSquashable()) {
+        if (setUnSquashable(pkt->getAddr(), pkt->isPreLock())) {
+            return RequestStatus_Issued;
+        } else {
+            return RequestStatus_Aliased;
+        }
+    } else if (pkt->isClearUnSquashable()) {
+        if (clearUnSquashable(pkt->getAddr())) {
+            return RequestStatus_Issued;
+        } else {
+            assert(false);
+        }
+    }
+
     // HTM abort signals must be allowed to reach the Sequencer
     // the same cycle they are issued. They cannot be retried.
     if ((m_outstanding_count >= m_max_outstanding_requests) &&
@@ -609,8 +867,13 @@ Sequencer::makeRequest(PacketPtr pkt)
         } else {
             DPRINTF(RubySequencer, "Issuing LL\n");
             assert(pkt->isRead());
-            primary_type = RubyRequestType_Load_Linked;
-            secondary_type = RubyRequestType_LD;
+            if (pkt->isSpeculative()) {
+                primary_type = RubyRequestType_Spec_Load_Linked;
+                secondary_type = RubyRequestType_SPEC_LD;
+            } else {
+                primary_type = RubyRequestType_Load_Linked;
+                secondary_type = RubyRequestType_LD;
+            }
         }
     } else if (pkt->req->isLockedRMW()) {
         //
@@ -620,9 +883,11 @@ Sequencer::makeRequest(PacketPtr pkt)
         // optimization built into the protocol.
         //
         if (pkt->isWrite()) {
+            DPRINTF(RubyTracer, "Locked RMW Write: %#x\n", pkt->getAddr());
             DPRINTF(RubySequencer, "Issuing Locked RMW Write\n");
             primary_type = RubyRequestType_Locked_RMW_Write;
         } else {
+            DPRINTF(RubyTracer, "Locked RMW Read: %#x\n", pkt->getAddr());
             DPRINTF(RubySequencer, "Issuing Locked RMW Read\n");
             assert(pkt->isRead());
             primary_type = RubyRequestType_Locked_RMW_Read;
@@ -654,8 +919,11 @@ Sequencer::makeRequest(PacketPtr pkt)
                         (X86ISA::StoreCheck << X86ISA::FlagShift);
                 }
                 if (storeCheck) {
+                    DPRINTF(RubyTracer, "RMW Read: %#x\n", pkt->getAddr());
                     primary_type = RubyRequestType_RMW_Read;
                     secondary_type = RubyRequestType_ST;
+                } else if (GCONFIGS.hw == utils::DOM && pkt->isSpeculative()) {
+                    primary_type = secondary_type = RubyRequestType_SPEC_LD;
                 } else {
                     primary_type = secondary_type = RubyRequestType_LD;
                 }
@@ -774,9 +1042,124 @@ Sequencer::evictionCallback(Addr address)
 }
 
 void
+Sequencer::updateCLT(Addr address, bool insert) {
+    updateCLT(address, insert, false);
+}
+
+void
+Sequencer::updateCLT(Addr address, bool insert, bool internal) {
+    if (!internal && !insert) {
+        // check whether MSHR holds a pending Store
+        if (IN_MAP(address, m_RequestTable) &&
+            m_RequestTable.at(address).front().m_second_type == RubyRequestType_ST) {
+            return;
+        }
+    }
+    DPRINTF(RubyTracer, "Update CLT for line %#x, insert: %d, internal: %d\n",
+            address, insert, internal);
+    ruby_updateCLT(address, insert, !internal);
+}
+
+void
+Sequencer::updateDelayedInvStat(bool isInvalidation, bool isPrefetch) {
+    if (isInvalidation) delayedInvalidations++;
+    else if (isPrefetch) droppedPrefetches++;
+    else delayedEvictions++;
+}
+
+bool
+Sequencer::setUnSquashable(Addr address, bool preLock) {
+    assert(address == makeLineAddress(address));
+    AbstractCacheEntry *line = m_dataCache_ptr->lookup(address);
+    AbstractCacheEntry *I_line = m_instCache_ptr->lookup(address);
+    bool IFetchPending = (IN_MAP(address, m_RequestTable) &&
+                          m_RequestTable.at(address).front().m_type == RubyRequestType_IFETCH) ||
+                         (IN_MAP(address, l_RequestTable) &&
+                          l_RequestTable.at(address).front().m_type == RubyRequestType_IFETCH);
+
+    if (line && !IFetchPending) {
+        line->setUnSquashable();
+        DPRINTF(RubyTracer, "Marked line %#x as un-squashable\n", address);
+        if (IN_SET(address, preLockBuffer)) {
+            preLockBuffer.erase(address);
+            DPRINTF(RubyTracer, "Locked a pre-locked line, "
+                    "entry %#x is removed from the buffer. Buffer size: %u\n",
+                    address, preLockBuffer.size());
+        }
+        return true;
+    } else if (I_line || IFetchPending) {
+        DPRINTF(RubyTracer, "Line %#x appears in L1I, cannot pre-lock\n",
+                address);
+        return false;
+    } else if (preLock) {
+        // if the line does not present, add to pre lock buffer
+        preLockBuffer.insert(address);
+        DPRINTF(RubyTracer, "Added %#x to pre-lock buffer. Buffer size: %u\n",
+                address, preLockBuffer.size());
+        return true;
+    } else {
+        // fail to lock the entry due to eviction since the last access
+        return false;
+    }
+}
+
+bool
+Sequencer::clearUnSquashable(Addr address) {
+    assert(address == makeLineAddress(address));
+    bool unlocked = false;
+
+    if (IN_SET(address, preLockBuffer)) {
+        preLockBuffer.erase(address);
+        unlocked = true;
+        DPRINTF(RubyTracer, "Unlocked a pre-locked line, "
+                "entry %#x is removed from the buffer. Buffer size: %u\n",
+                address, preLockBuffer.size());
+    }
+
+    AbstractCacheEntry *line = m_dataCache_ptr->lookup(address);
+    if (line) {
+        line->clearUnSquashable();
+        unlocked = true;
+        DPRINTF(RubyTracer, "Clear un-squashable bit of line %#x\n", address);
+    }
+
+    // if (unlocked) {
+    //     trySendRetries();
+    // } else {
+    //     DPRINTF(RubyTracer, "Bad unlock of line %#x\n", address);
+    // }
+
+    assert(unlocked); // it should always be unlocked
+    return unlocked;
+}
+
+bool
+Sequencer::isUnSquashable(Addr address) {
+    assert(address == makeLineAddress(address));
+
+    if (IN_SET(address, preLockBuffer)) {
+        return true;
+    }
+
+    AbstractCacheEntry *line = m_dataCache_ptr->lookup(address);
+    if (line) {
+        return line->isUnSquashable();
+    } else {
+        return false;
+    }
+}
+
+void
 Sequencer::regStats()
 {
     RubyPort::regStats();
+
+    specRubyReadCnt.desc("Speculative ruby reads").prereq(specRubyReadCnt);
+    specL1MissCnt.desc("Speculative ruby reads miss in L1").prereq(specL1MissCnt);
+
+    delayedInvalidations.desc("Delayed invalidations").prereq(delayedInvalidations);
+    delayedEvictions.desc("Delayed evictions").prereq(delayedEvictions);
+    droppedPrefetches.desc("Dropped prefetches").prereq(droppedPrefetches);
 
     // These statistical variables are not for display.
     // The profiler will collate these across different

@@ -61,6 +61,7 @@
 #include "params/DerivO3CPU.hh"
 
 using namespace std;
+using bridge::GCONFIGS;
 
 template<class Impl>
 DefaultIEW<Impl>::DefaultIEW(O3CPU *_cpu, DerivO3CPUParams *params)
@@ -513,6 +514,7 @@ DefaultIEW<Impl>::squashDueToBranch(const DynInstPtr& inst, ThreadID tid)
         toCommit->includeSquashInst[tid] = false;
 
         wroteToTimeBuffer = true;
+        DSTATE(SQ-Mispred, inst);
     }
 
 }
@@ -541,6 +543,7 @@ DefaultIEW<Impl>::squashDueToMemOrder(const DynInstPtr& inst, ThreadID tid)
         toCommit->includeSquashInst[tid] = true;
 
         wroteToTimeBuffer = true;
+        DSTATE(SQ-MemVio, inst);
     }
 }
 
@@ -617,6 +620,39 @@ DefaultIEW<Impl>::cacheUnblocked()
 
 template<class Impl>
 void
+DefaultIEW<Impl>::retryWB(ThreadID tid) {
+    size_t cnt = WBDeferred[tid].size();
+    size_t idx = 0;
+
+    for (auto it = WBDeferred[tid].begin();
+         it != WBDeferred[tid].end() && idx < cnt; it++, idx++) {
+
+        assert((*it)->isSquashing() || (*it)->isWBBlocked());
+        bool canWB = false;
+
+        if ((*it)->isSquashed()) {
+            canWB = true;
+        } else if ((*it)->isWBBlocked()) {
+            (*it)->resetWBBlocked();
+            canWB = true;
+        } else {
+            if ((*it)->isReachedOSP() || (*it)->getFault() != NoFault) {
+                canWB = true;
+            }
+        }
+
+        if (canWB) {
+            (*it)->resetPendingWB();
+            if (!(*it)->isSquashed()) {
+                instToCommit(*it);
+            }
+            WBDeferred[tid].erase(it--);
+        }
+    }
+}
+
+template<class Impl>
+void
 DefaultIEW<Impl>::instToCommit(const DynInstPtr& inst)
 {
     // This function should not be called after writebackInsts in a
@@ -629,12 +665,27 @@ DefaultIEW<Impl>::instToCommit(const DynInstPtr& inst)
     // and write the instruction to that time.  If there are not,
     // keep looking back to see where's the first time there's a
     // free slot.
-    while ((*iewQueue)[wbCycle].insts[wbNumInst]) {
+    while ((wbCycle <= iewQueue->getFuture()) &&
+           (*iewQueue)[wbCycle].insts[wbNumInst]) {
         ++wbNumInst;
         if (wbNumInst == wbWidth) {
             ++wbCycle;
             wbNumInst = 0;
         }
+    }
+
+    if (wbCycle > iewQueue->getFuture()) {
+        inst->setWBBlocked();
+    }
+
+    if (inst->isWBBlocked() ||
+        (GCONFIGS.delayWB && !inst->isSquashed() && inst->isExecuted() &&
+        inst->getFault() == NoFault && inst->isSquashing() &&
+        inst->isWBDelayable() && !inst->isReachedOSP())) {
+        inst->setPendingWB();
+        CSPRINT(DelayWB, inst, "num dest: %d\n", inst->numDestRegs());
+        WBDeferred[inst->threadNumber].push_back(inst);
+        return;
     }
 
     DPRINTF(IEW, "Current wb cycle: %i, width: %i, numInst: %i\nwbActual:%i\n",
@@ -1277,6 +1328,16 @@ DefaultIEW<Impl>::executeInsts()
             DPRINTF(IEW, "Execute: Calculating address for memory "
                     "reference.\n");
 
+            if ((GCONFIGS.hw == utils::FENCE || GCONFIGS.hw == utils::STT) &&
+                inst->isTransmitter() &&
+                inst->isSpeculative() &&
+                !inst->isReachedESP() &&
+                inst->isMemRef() &&
+                !inst->isSquashed()) {
+                instQueue.fenceMemInst(inst);
+                continue;
+            }
+
             // Tell the LDSTQ to execute this instruction (if it is a load).
             if (inst->isAtomic()) {
                 // AMOs are treated like store requests
@@ -1538,6 +1599,7 @@ DefaultIEW<Impl>::tick()
 
         checkSignalsAndUpdate(tid);
         dispatch(tid);
+        retryWB(tid);
     }
 
     if (exeStatus != Squashing) {
@@ -1549,6 +1611,17 @@ DefaultIEW<Impl>::tick()
         // (In actuality, this scheduling is for instructions that will
         // be executed next cycle.)
         instQueue.scheduleReadyInsts();
+
+        // Re-issued delayed loads that missed in L1
+        if (GCONFIGS.hw == utils::DOM) {
+            ldstQueue.reIssueDelayedReqs();
+        }
+
+        if (GCONFIGS.delayInvAck) {
+            ldstQueue.markUnSquashables();
+        }
+
+        ldstQueue.issueEagerTranslated();
 
         // Also should advance its own time buffers if the stage ran.
         // Not the best place for it, but this works (hopefully).

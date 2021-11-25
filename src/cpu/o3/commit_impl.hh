@@ -62,11 +62,14 @@
 #include "debug/ExecFaulting.hh"
 #include "debug/HtmCpu.hh"
 #include "debug/O3PipeView.hh"
+#include "debug/SQUASH.hh"
+#include "debug/ROBDump.hh"
 #include "params/DerivO3CPU.hh"
 #include "sim/faults.hh"
 #include "sim/full_system.hh"
 
 using namespace std;
+using bridge::GCONFIGS;
 
 template <class Impl>
 void
@@ -125,8 +128,17 @@ DefaultCommit<Impl>::DefaultCommit(O3CPU *_cpu, DerivO3CPUParams *params)
         renameMap[tid] = nullptr;
         htmStarts[tid] = 0;
         htmStops[tid] = 0;
+        _last_retirement[tid] = 0;
     }
     interrupt = NoFault;
+
+    _print_interval_inst = max(GCONFIGS.maxInsts / 1000, _print_interval_inst);
+    _print_interval_tick = max(GCONFIGS.maxTicks / 1000, _print_interval_tick);
+    if (GCONFIGS.maxInsts) {
+        _print_inst = true;
+    } else if (GCONFIGS.maxTicks) {
+        _print_tick = true;
+    }
 }
 
 template <class Impl>
@@ -347,6 +359,7 @@ DefaultCommit<Impl>::clearStates(ThreadID tid)
     pc[tid].set(0);
     lastCommitedSeqNum[tid] = 0;
     squashAfterInst[tid] = NULL;
+    _last_retirement[tid] = 0;
 }
 
 template <class Impl>
@@ -378,6 +391,16 @@ DefaultCommit<Impl>::drainSanityCheck() const
             panic("cannot drain partially through a HTM transaction");
         }
     }
+}
+
+template <class Impl>
+void
+DefaultCommit<Impl>::dumpPerfCounter()
+{
+    if (!GCONFIGS.collectPerfStats) {
+        return;
+    }
+    PERF_CNT.dumpAll(std::cout, GCONFIGS.maxInsts / 10000);
 }
 
 template <class Impl>
@@ -420,6 +443,7 @@ DefaultCommit<Impl>::takeOverFrom()
         trapSquash[tid] = false;
         tcSquash[tid] = false;
         squashAfterInst[tid] = NULL;
+        _last_retirement[tid] = 0;
     }
     rob->takeOverFrom();
 }
@@ -646,8 +670,12 @@ DefaultCommit<Impl>::squashAfter(ThreadID tid, const DynInstPtr &head_inst)
     DPRINTF(Commit, "Executing squash after for [tid:%i] inst [sn:%llu]\n",
             tid, head_inst->seqNum);
 
+    DSTATE(SquashAftering, head_inst);
+
     assert(!squashAfterInst[tid] || squashAfterInst[tid] == head_inst);
     commitStatus[tid] = SquashAfterPending;
+    DPRINTF(Tracer, "SquashAfter\n");
+    rob->setPendingSquash(tid);
     squashAfterInst[tid] = head_inst;
 }
 
@@ -677,6 +705,7 @@ DefaultCommit<Impl>::tick()
 
             if (rob->isDoneSquashing(tid)) {
                 commitStatus[tid] = Running;
+                rob->clearPendingSquash(tid);
             } else {
                 DPRINTF(Commit,"[tid:%i] Still Squashing, cannot commit any"
                         " insts this cycle.\n", tid);
@@ -685,11 +714,26 @@ DefaultCommit<Impl>::tick()
                 wroteToTimeBuffer = true;
             }
         }
+        if (!_init_tick) _init_tick = curTick();
+        uint64_t dist = curTick() - _init_tick;
+        if (_print_tick && (dist % _print_interval_tick == 0)) {
+            fprintf(stderr, "\rCtx #%d: %.1f%%", cpu->thread[tid]->contextId(),
+                    dist * 100.0 / GCONFIGS.maxTicks);
+        }
+
+        if (_print_tick && dist == GCONFIGS.maxTicks && !_perf_dumped) {
+            _perf_dumped = true;
+            dumpPerfCounter();
+        }
     }
 
     commit();
 
     markCompletedInsts();
+
+    if (GCONFIGS.hw != utils::UNSAFE_CORE || DTRACE(ROBDump)) {
+        rob->updateSpecStatus();
+    }
 
     threads = activeThreads->begin();
 
@@ -706,7 +750,7 @@ DefaultCommit<Impl>::tick()
             DPRINTF(Commit,"[tid:%i] Instruction [sn:%llu] PC %s is head of"
                     " ROB and ready to commit\n",
                     tid, inst->seqNum, inst->pcState());
-
+            _last_retirement[tid] = curTick();
         } else if (!rob->isEmpty(tid)) {
             const DynInstPtr &inst = rob->readHeadInst(tid);
 
@@ -715,6 +759,29 @@ DefaultCommit<Impl>::tick()
             DPRINTF(Commit,"[tid:%i] Can't commit, Instruction [sn:%llu] PC "
                     "%s is head of ROB and not ready\n",
                     tid, inst->seqNum, inst->pcState());
+
+            if (_last_retirement[tid] &&
+                (curTick() - _last_retirement[tid] >
+                bridge::DEADLOCK_THRESHOLD * bridge::TICKS_PER_CYCLE)) {
+                cerr << curTick()
+                     << ": "
+                     << "thread #" << inst->getContextId()
+                     << " (SMT " << tid << ")"
+                     << " hasn't committed any instructions in "
+                     << bridge::DEADLOCK_THRESHOLD
+                     << " cycles. Possible deadlock detected!"
+                     << endl
+                     << "Inst: " << inst->getContextId()
+                     << "@0x" << inst->instAddr()
+                     << "(" << inst->typeCode << ")"
+                     << "@" << inst->seqNum
+                     << endl
+                     << "Last retirement: "
+                     << _last_retirement[tid]
+                     << endl;
+
+                panic("Deadlock at commit");
+            }
         }
 
         DPRINTF(Commit, "[tid:%i] ROB has %d insts & %d free entries.\n",
@@ -866,9 +933,13 @@ DefaultCommit<Impl>::commit()
                     tid,
                     fromIEW->mispredictInst[tid]->instAddr(),
                     fromIEW->squashedSeqNum[tid]);
+                CCSPRINT(SQUASH, BranchMispred, fromIEW->mispredictInst[tid],
+                         "Thread: %i is squashing due to branch mispred\n", tid);
             } else {
                 DPRINTF(Commit,
                     "[tid:%i] Squashing due to order violation [sn:%llu]\n",
+                    tid, fromIEW->squashedSeqNum[tid]);
+                DPRINTF(SQUASH, "Thread %i is squashing due to order violation @%llu\n",
                     tid, fromIEW->squashedSeqNum[tid]);
             }
 
@@ -1305,6 +1376,11 @@ DefaultCommit<Impl>::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
         thread[tid]->noSquashFromTC = false;
 
         commitStatus[tid] = TrapPending;
+        CSPRINT(TrapPending, head_inst, "; fault: %s\n",
+                head_inst->getFault()->name());
+        CCSPRINT(SQUASH, TrapPending, head_inst, "; fault: %s\n",
+                 head_inst->getFault()->name());
+        rob->setPendingSquash(tid);
 
         DPRINTF(Commit,
             "[tid:%i] [sn:%llu] Committing instruction with fault\n",
@@ -1360,6 +1436,10 @@ DefaultCommit<Impl>::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
 
     // Finally clear the head ROB entry.
     rob->retireHead(tid);
+
+    DSTATE(RetireHead, head_inst);
+    head_inst->setReachedVP();
+    head_inst->setReachedOSP();
 
 #if TRACING_ON
     if (DTRACE(O3PipeView)) {
@@ -1436,8 +1516,18 @@ DefaultCommit<Impl>::updateComInstStats(const DynInstPtr &inst)
 {
     ThreadID tid = inst->threadNumber;
 
-    if (!inst->isMicroop() || inst->isLastMicroop())
+    if (!inst->isMicroop() || inst->isLastMicroop()) {
         stats.instsCommitted[tid]++;
+        uint64_t cnt = stats.instsCommitted[tid].value();
+        if (_print_inst && (cnt % _print_interval_inst == 0)) {
+            fprintf(stderr, "\rCtx #%d: %.1f%%", cpu->thread[tid]->contextId(),
+                    cnt * 100.0 / GCONFIGS.maxInsts);
+        }
+        if (_print_inst && cnt == GCONFIGS.maxInsts && !_perf_dumped) {
+            _perf_dumped = true;
+            dumpPerfCounter();
+        }
+    }
     stats.opsCommitted[tid]++;
 
     // To match the old model, don't count nops and instruction

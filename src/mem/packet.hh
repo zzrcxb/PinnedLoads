@@ -61,6 +61,7 @@
 #include "mem/htm.hh"
 #include "mem/request.hh"
 #include "sim/core.hh"
+#include "cpu/global_utils.hh"
 
 class Packet;
 typedef Packet *PacketPtr;
@@ -82,6 +83,8 @@ class MemCmd
         ReadReq,
         ReadResp,
         ReadRespWithInvalidate,
+        SpecReadReq,  // speculative read request
+        SpecReadResp, // speculative read response
         WriteReq,
         WriteResp,
         WriteCompleteResp,
@@ -105,6 +108,7 @@ class MemCmd
         ReadCleanReq,
         ReadSharedReq,
         LoadLockedReq,
+        LoadLockedSpecReq,
         StoreCondReq,
         StoreCondFailReq,       // Failed StoreCondReq in MSHR (never sent)
         StoreCondResp,
@@ -132,10 +136,14 @@ class MemCmd
         FlushReq,      //request for a cache flush
         InvalidateReq,   // request for address to be invalidated
         InvalidateResp,
+        InsertCLTReq,
+        EraseCLTReq,
         // hardware transactional memory
         HTMReq,
         HTMReqResp,
         HTMAbort,
+        SetUnSquashable,
+        ClearUnSquashable,
         NUM_MEM_CMDS
     };
 
@@ -163,6 +171,7 @@ class MemCmd
         IsPrint,        //!< Print state matching address (for debugging)
         IsFlush,        //!< Flush the address from caches
         FromCache,      //!< Request originated from a caching agent
+        IsSpeculative,  //!< Speculative read request
         NUM_COMMAND_ATTRIBUTES
     };
 
@@ -228,6 +237,8 @@ class MemCmd
     bool isError() const        { return testCmdAttrib(IsError); }
     bool isPrint() const        { return testCmdAttrib(IsPrint); }
     bool isFlush() const        { return testCmdAttrib(IsFlush); }
+
+    bool isSpeculative() const  { return testCmdAttrib(IsSpeculative); }
 
     Command
     responseCommand() const
@@ -323,7 +334,13 @@ class Packet : public Printable
 
         // Signal block present to squash prefetch and cache evict packets
         // through express snoop flag
-        BLOCK_CACHED          = 0x00010000
+        BLOCK_CACHED          = 0x00010000,
+        L1HIT                 = 0x00020000,
+        SPEC_L1HIT            = 0x00040000,
+        SPEC_REQ_SENT         = 0x00080000,
+        NOT_MEM_ADDR          = 0x00100000,
+        PRE_LOCK              = 0x00200000,
+        EXTERNAL_UPDATE       = 0x00400000,
     };
 
     Flags flags;
@@ -584,6 +601,23 @@ class Packet : public Printable
     bool isPrint() const             { return cmd.isPrint(); }
     bool isFlush() const             { return cmd.isFlush(); }
 
+    bool isSpeculative() const       { return cmd.isSpeculative(); }
+
+    bool isL1Hit() const { return flags.isSet(L1HIT); }
+    void setL1Hit() { flags.set(L1HIT); }
+
+    bool isSpecL1Hit() const { return flags.isSet(SPEC_L1HIT); }
+    void setSpecL1Hit() { flags.set(SPEC_L1HIT); }
+
+    bool isSpecReqSent() const { return flags.isSet(SPEC_REQ_SENT); }
+    void setSpecReqSent() { flags.set(SPEC_REQ_SENT); }
+
+    bool notInMemAddr() const { return flags.isSet(NOT_MEM_ADDR); }
+    void setNotMemAddr() { flags.set(NOT_MEM_ADDR); }
+
+    bool isPreLock() const { return flags.isSet(PRE_LOCK); }
+    void setPreLock() { flags.set(PRE_LOCK); }
+
     bool isWholeLineWrite(unsigned blk_size)
     {
         return (cmd == MemCmd::WriteReq || cmd == MemCmd::WriteLineReq) &&
@@ -817,6 +851,14 @@ class Packet : public Printable
     }
 
     /**
+     * When loads reach ESP, convert speculative read to normal read
+     */
+    void convertSpecReadToRead() {
+        assert(isSpeculative());
+        cmd = makeReadCmd(req);
+    }
+
+    /**
      * Constructor. Note that a Request object must be constructed
      * first, but the Requests's physical address and size fields need
      * not be valid. The command must be supplied.
@@ -986,6 +1028,43 @@ class Packet : public Printable
     createWrite(const RequestPtr &req)
     {
         return new Packet(req, makeWriteCmd(req));
+    }
+
+    static PacketPtr
+    createSpecRead(const RequestPtr &req) {
+        if (req->isLLSC()) {
+            return new Packet(req, MemCmd::LoadLockedSpecReq);
+        } else {
+            return new Packet(req, MemCmd::SpecReadReq);
+        }
+    }
+
+    bool isSetUnSquashable() const {
+        return cmd == MemCmd::SetUnSquashable;
+    }
+
+    bool isClearUnSquashable() const {
+        return cmd == MemCmd::ClearUnSquashable;
+    }
+
+    bool isUpdateCLT() const {
+        return cmd == MemCmd::InsertCLTReq || cmd == MemCmd::EraseCLTReq;
+    }
+
+    bool isInsertCLT() const {
+        return cmd == MemCmd::InsertCLTReq;
+    }
+
+    bool isEraseCLT() const {
+        return cmd == MemCmd::EraseCLTReq;
+    }
+
+    bool isExternalUpdate() const {
+        return flags.isSet(EXTERNAL_UPDATE);
+    }
+
+    void setExternalUpdate() {
+        flags.set(EXTERNAL_UPDATE);
     }
 
     /**

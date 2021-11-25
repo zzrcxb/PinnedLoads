@@ -57,12 +57,15 @@
 #include "cpu/o3/cpu_policy.hh"
 #include "cpu/o3/scoreboard.hh"
 #include "cpu/o3/thread_state.hh"
+#include "cpu/o3/perf_counter.hh"
 #include "cpu/activity.hh"
 #include "cpu/base.hh"
 #include "cpu/simple_thread.hh"
 #include "cpu/timebuf.hh"
 #include "params/DerivO3CPU.hh"
 #include "sim/process.hh"
+
+extern PerfCounter PERF_CNT;
 
 template <class>
 class Checker;
@@ -544,12 +547,10 @@ class FullO3CPU : public BaseO3CPU
      */
     std::queue<ListIt> removeList;
 
-#ifdef DEBUG
     /** Debug structure to keep track of the sequence numbers still in
      * flight.
      */
     std::set<InstSeqNum> snList;
-#endif
 
     /** Records if instructions need to be removed this cycle due to
      *  being retired or squashed.
@@ -723,6 +724,10 @@ class FullO3CPU : public BaseO3CPU
                 flags, res, std::move(amo_op), byte_enable);
     }
 
+    Fault setMemData(const DynInstPtr& inst, uint8_t *data) {
+        return iew.ldstQueue.setMemData(inst, data);
+    }
+
     /** CPU read function, forwards read to LSQ. */
     Fault read(LSQRequest* req, int load_idx)
     {
@@ -787,6 +792,16 @@ class FullO3CPU : public BaseO3CPU
     //number of misc
     Stats::Scalar miscRegfileReads;
     Stats::Scalar miscRegfileWrites;
+
+    Stats::Scalar earlyOSPDueToDelayAck;
+
+    Stats::Scalar squashedESP;
+    Stats::Scalar squashedVP;
+    Stats::Scalar squashedOSP;
+
+    Stats::Scalar unSquashableNotReadyVP;
+    Stats::Scalar unSquashableNotReadyExcept;
+    Stats::Scalar unSquashableNotReadyData;
 
   public:
     // hardware transactional memory

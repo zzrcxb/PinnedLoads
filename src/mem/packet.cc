@@ -81,6 +81,9 @@ MemCmd::commandInfo[] =
     /* ReadRespWithInvalidate */
     { SET4(IsRead, IsResponse, HasData, IsInvalidate),
             InvalidCmd, "ReadRespWithInvalidate" },
+    /* Speculative load for DOM*/
+    { SET4(IsRead, IsRequest, IsSpeculative, NeedsResponse), SpecReadResp, "SpecReadReq" },
+    { SET4(IsRead, IsResponse, IsSpeculative, HasData), InvalidCmd, "SpecReadResp" },
     /* WriteReq */
     { SET5(IsWrite, NeedsWritable, IsRequest, NeedsResponse, HasData),
             WriteResp, "WriteReq" },
@@ -168,6 +171,8 @@ MemCmd::commandInfo[] =
      *                we can also use ReadRespWithInvalidate when needed */
     { SET4(IsRead, IsLlsc, IsRequest, NeedsResponse),
             ReadResp, "LoadLockedReq" },
+    { SET5(IsRead, IsLlsc, IsRequest, IsSpeculative, NeedsResponse),
+            SpecReadResp, "LoadLockedSpecReq" },
     /* StoreCondReq */
     { SET6(IsWrite, NeedsWritable, IsLlsc,
            IsRequest, NeedsResponse, HasData),
@@ -231,10 +236,14 @@ MemCmd::commandInfo[] =
     /* Invalidation Response */
     { SET2(IsInvalidate, IsResponse),
       InvalidCmd, "InvalidateResp" },
+    { SET1(IsRequest), InvalidCmd, "InsertCLTReq"},
+    { SET1(IsRequest), InvalidCmd, "EraseCLTReq"},
       // hardware transactional memory
     { SET3(IsRead, IsRequest, NeedsResponse), HTMReqResp, "HTMReq" },
     { SET2(IsRead, IsResponse), InvalidCmd, "HTMReqResp" },
     { SET2(IsRead, IsRequest), InvalidCmd, "HTMAbort" },
+    { SET1(IsRequest), InvalidCmd, "SetUnSquashable" },
+    { SET1(IsRequest), InvalidCmd, "ClearUnSquashable" },
 };
 
 AddrRange

@@ -55,6 +55,7 @@
 #include "cpu/timebuf.hh"
 #include "enums/SMTQueuePolicy.hh"
 #include "sim/eventq.hh"
+#include "cpu/global_utils.hh"
 
 struct DerivO3CPUParams;
 class FUPool;
@@ -195,6 +196,12 @@ class InstructionQueue
      */
     DynInstPtr getDeferredMemInstToExecute();
 
+    /** Checks whether fenced mem instructions are safe to execute */
+    void getFencedMemInstToExecute();
+
+    /** Checks whether fenced non-memory instructions are safe to execute */
+    void getFencedGenericInstToExecute();
+
     /** Gets a memory instruction that was blocked on the cache. NULL if none
      *  available.
      */
@@ -245,6 +252,10 @@ class InstructionQueue
      * page table walk.
      */
     void deferMemInst(const DynInstPtr &deferred_inst);
+
+    void fenceMemInst(const DynInstPtr &fenced_inst);
+
+    void fenceGenericInst(const DynInstPtr &fenced_inst);
 
     /**  Defers a memory instruction when it is cache blocked. */
     void blockMemInst(const DynInstPtr &blocked_inst);
@@ -316,7 +327,7 @@ class InstructionQueue
     /** List of instructions waiting for their DTB translation to
      *  complete (hw page table walk in progress).
      */
-    std::list<DynInstPtr> deferredMemInsts;
+    std::list<DynInstPtr> deferredMemInsts, fencedMemInsts, fencedGenericInsts;
 
     /** List of instructions that have been cache blocked. */
     std::list<DynInstPtr> blockedMemInsts;
@@ -470,6 +481,11 @@ class InstructionQueue
      *  IQ.
      */
     void dumpInsts();
+
+    /** Stat for fence */
+    Stats::Scalar iqInstsFenced;
+    Stats::Scalar iqMemInstsFenced;
+    Stats::Scalar iqGenericInstsFenced;
 
     /** Stat for number of instructions added. */
     Stats::Scalar iqInstsAdded;

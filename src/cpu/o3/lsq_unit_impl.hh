@@ -43,9 +43,13 @@
 #ifndef __CPU_O3_LSQ_UNIT_IMPL_HH__
 #define __CPU_O3_LSQ_UNIT_IMPL_HH__
 
+#include <map>
+#include <cmath>
 #include "arch/generic/debugfaults.hh"
+#include "arch/x86/ldstflags.hh"
 #include "arch/locked_mem.hh"
 #include "base/str.hh"
+#include "base/intmath.hh"
 #include "config/the_isa.hh"
 #include "cpu/checker/cpu.hh"
 #include "cpu/o3/lsq.hh"
@@ -55,8 +59,12 @@
 #include "debug/IEW.hh"
 #include "debug/LSQUnit.hh"
 #include "debug/O3PipeView.hh"
+#include "debug/ROBDump.hh"
 #include "mem/packet.hh"
 #include "mem/request.hh"
+
+using bridge::GCONFIGS;
+using namespace std;
 
 template<class Impl>
 LSQUnit<Impl>::WritebackEvent::WritebackEvent(const DynInstPtr &_inst,
@@ -104,6 +112,35 @@ LSQUnit<Impl>::recvTimingResp(PacketPtr pkt)
     }
     return ret;
 
+}
+
+template <class Impl>
+void
+LSQUnit<Impl>::reIssueDelayedReqs() {
+    assert(GCONFIGS.hw == utils::DOM);
+    std::vector<LSQRequest*> toErase;
+
+    for (auto *req : delayedReqs) {
+        auto &inst = req->instruction();
+        if (inst->isReachedESP() ||
+            inst->isSquashed()) {
+            if (inst->isSquashed() ||
+                req->isReIssued()) {
+                DSTATE(ReIssueSquashed, inst);
+                toErase.push_back(req);
+            } else {
+                req->resetSpeculative();
+                req->reIssue();
+                if (req->isReIssued()) {
+                    toErase.push_back(req);
+                }
+            }
+        }
+    }
+
+    for (auto *req : toErase) {
+        delayedReqs.erase(req);
+    }
 }
 
 template<class Impl>
@@ -176,7 +213,7 @@ LSQUnit<Impl>::completeDataAccess(PacketPtr pkt)
     if (!inst->isSquashed()) {
         if (state->needWB) {
             // Only loads, store conditionals and atomics perform the writeback
-            // after receving the response from the memory
+            // after receiving the response from the memory
             assert(inst->isLoad() || inst->isStoreConditional() ||
                    inst->isAtomic());
 
@@ -186,6 +223,7 @@ LSQUnit<Impl>::completeDataAccess(PacketPtr pkt)
                     pkt->getHtmTransactionFailedInCacheRC() );
             }
 
+            DSTATE(WritebackBegin, inst);
             writeback(inst, state->request()->mainPacket());
             if (inst->isStore() || inst->isAtomic()) {
                 auto ss = dynamic_cast<SQSenderState*>(state);
@@ -232,6 +270,65 @@ LSQUnit<Impl>::init(O3CPU *cpu_ptr, IEW *iew_ptr, DerivO3CPUParams *params,
     checkLoads = params->LSQCheckLoads;
     needsTSO = params->needsTSO;
 
+    if (GCONFIGS.delayInvAck) {
+        L1StartIndexBit = static_cast<uint>(log2(GCONFIGS.cachelineSize));
+        L1DNumSetBit = static_cast<uint>(floorLog2(
+            (GCONFIGS.L1DSize / GCONFIGS.L1DAssoc) / GCONFIGS.cachelineSize
+        ));
+        L2NumSetBit = static_cast<uint>(floorLog2(
+            (GCONFIGS.L2Size / GCONFIGS.L2Assoc) / GCONFIGS.cachelineSize
+        ));
+        numL2Bit = static_cast<uint>(log2(GCONFIGS.numL2));
+        // L2StartIndexBit = L1StartIndexBit + numL2Bit;
+        // these two should be the same if we switch to Haswell's hash function
+        L2StartIndexBit = L1StartIndexBit;
+
+        L1DConflictSize = GCONFIGS.L1DAssoc;
+
+        if (GCONFIGS.L2VPartition > 1) {
+            if (GCONFIGS.L2Assoc % GCONFIGS.L2VPartition != 0) {
+                cerr << ZWARN
+                    << "L2 associativity cannot be divided by L2 VPartition! "
+                    << "Fallback to Strict mode."
+                    << endl;
+                nsrPolicy = STRICT;
+            } else {
+                L2ConflictSize = GCONFIGS.L2Assoc / GCONFIGS.L2VPartition;
+                nsrPolicy = PARTITIONED;
+
+                assert(GCONFIGS.L1DCSTRecordCnt <= L1DConflictSize);
+                assert(GCONFIGS.L2CSTRecordCnt <= L2ConflictSize);
+            }
+        } else {
+            nsrPolicy = STRICT;
+        }
+
+        map<NSRPolicy, string> _policies = {
+            {STRICT, "Strict"},
+            {PARTITIONED, "Partitioned"}};
+
+        if (!bridge::LSQ_PROMPTED) {
+            cerr << ZINFO
+                 << "NSR Mode: " << _policies.at(nsrPolicy);
+            if (nsrPolicy == PARTITIONED) {
+                cerr << " virtual partition size: " << L2ConflictSize << endl;
+                cerr << ZINFO
+                     << "L1DCST (#Entries X #Records): " << GCONFIGS.L1DCSTEntryCnt
+                     << "X" << GCONFIGS.L1DCSTRecordCnt << endl
+                     << ZINFO
+                     << "L2CST (#Entries X #Records): " << GCONFIGS.L2CSTEntryCnt
+                     << "X" << GCONFIGS.L2CSTRecordCnt << endl
+                     << ZINFO
+                     << "Use CAM: " << GCONFIGS.entryUseCAM << endl
+                     << ZINFO
+                     << "CST Addr field: " << GCONFIGS.CSTRecordSize << " bits"
+                     << "; Compressed: " << GCONFIGS.compressCST;
+            }
+            cerr << endl;
+            bridge::LSQ_PROMPTED = true;
+        }
+    }
+
     resetState();
 }
 
@@ -254,6 +351,18 @@ LSQUnit<Impl>::resetState()
     stalled = false;
 
     cacheBlockMask = ~(cpu->cacheLineSize() - 1);
+
+    stats.lockedLQEntryNum.init(0, loadQueue.capacity() - 1, 1).flags(Stats::pdf);
+    stats.L1DCSTEntries.init(0, GCONFIGS.L1DCSTEntryCnt, 1).flags(Stats::pdf);
+    stats.L2CSTEntries.init(0, GCONFIGS.L2CSTEntryCnt, 1).flags(Stats::pdf);
+    stats.CLTEntries.init(0, GCONFIGS.CLTSize, 1).flags(Stats::pdf);
+
+    if (nsrPolicy == PARTITIONED) {
+        L1DCST = make_shared<CacheShadowTable>(GCONFIGS.L1DCSTEntryCnt,
+                    GCONFIGS.L1DCSTRecordCnt, cacheBlockMask);
+        L2CST = make_shared<CacheShadowTable>(GCONFIGS.L2CSTEntryCnt,
+                    GCONFIGS.L2CSTRecordCnt, cacheBlockMask);
+    }
 }
 
 template<class Impl>
@@ -279,7 +388,40 @@ LSQUnit<Impl>::LSQUnitStats::LSQUnitStats(Stats::Group *parent)
       ADD_STAT(squashedStores, "Number of stores squashed"),
       ADD_STAT(rescheduledLoads, "Number of loads that were rescheduled"),
       ADD_STAT(blockedByCache, "Number of times an access to memory failed"
-          " due to the cache being blocked")
+          " due to the cache being blocked"),
+      ADD_STAT(unSquashables, "Number of un-squashable LQ entries"),
+      ADD_STAT(preLocks, "Number of pre-locked LQ entries"),
+      ADD_STAT(NSRConflictChecks, "Number of NSR conflict checks"),
+      ADD_STAT(NSRConflicts, "Number of NSR conflicts"),
+      ADD_STAT(NSRL1Conflicts, "Number of NSR L1 conflicts"),
+      ADD_STAT(NSRLLCConflicts, "Number of NSR LLC conflicts"),
+      ADD_STAT(NSRLockingReq, "Number of NSR locking req sent from LSQUnit"),
+      ADD_STAT(NSRUnlockingReq, "Number of NSR unlocking req sent from LSQUnit"),
+      ADD_STAT(squashedLocked, "Number of squashed un-squashable entries, should be 0"),
+      ADD_STAT(eagerTranslated, "Number of eagerly translated stores"),
+      ADD_STAT(delayedFwd, "Number of delayed load forwarding"),
+      ADD_STAT(lockedLQEntryNum, "Distribution of number of locked LQ entries"),
+      ADD_STAT(L1DCSTOverflow, "Number of L1D CST overflow"),
+      ADD_STAT(L1DCSTTagMiss, "Number of L1D CST tag miss"),
+      ADD_STAT(L1DCSTHashCollision, "Number of L1D CST hash collision"),
+      ADD_STAT(L1DCSTTagMissConf, "Number of L1D CST tag miss causes conflicts"),
+      ADD_STAT(L1DCSTHashColConf, "Number of L1D CST hash collision causes conflicts"),
+      ADD_STAT(L1DCSTEntries, "Number of L1D CST entries"),
+      ADD_STAT(L2CSTOverflow, "Number of L2 CST overflow"),
+      ADD_STAT(L2CSTTagMiss, "Number of L2 CST tag miss"),
+      ADD_STAT(L2CSTHashCollision, "Number of L2 CST hash collision"),
+      ADD_STAT(L2CSTTagMissConf, "Number of L2 CST tag miss causes conflicts"),
+      ADD_STAT(L2CSTHashColConf, "Number of L2 CST hash collision causes conflicts"),
+      ADD_STAT(L2CSTEntries, "Number of L2 CST entries"),
+      ADD_STAT(CLTOverflow, "Number of CLT overflow"),
+      ADD_STAT(CLTEntries, "Number of CLT entries"),
+      ADD_STAT(NSRUnlockVP, "Cannot Lock due to not reaching VP"),
+      ADD_STAT(NSRUnlockException, "Cannot Lock due to exception"),
+      ADD_STAT(NSRUnlockAddr, "Cannot Lock due to address not valid"),
+      ADD_STAT(NSRUnlockDataRecv, "Cannot Lock due to not receiving data"),
+      ADD_STAT(NSRUnlockConflicts, "Cannot Lock due to resource conflicts"),
+      ADD_STAT(NSRUnlockRMW, "Cannot Lock due to RMW"),
+      ADD_STAT(NSRUnlockSB, "Cannot Lock due to store buffer is full")
 {
 }
 
@@ -444,6 +586,32 @@ LSQUnit<Impl>::numFreeStoreEntries()
 
 template <class Impl>
 void
+LSQUnit<Impl>::updateCLT(PacketPtr pkt)
+{
+    assert(pkt->isUpdateCLT());
+    Addr addr = pkt->getAddr() & cacheBlockMask;
+
+    if (pkt->isInsertCLT()) {
+        if (!IN_SET(addr, unlockableLines)) {
+            if (unlockableLines.size() < GCONFIGS.CLTSize) {
+                unlockableLines.insert(addr);
+                DPRINTF(NSR, "Add %#x to CLT\n", addr);
+            } else {
+                stats.CLTOverflow += 1;
+                CLTOverflowed = true;
+                DPRINTF(NSR, "CLT overflow, line: %#x\n", addr);
+            }
+        }
+    } else if (pkt->isEraseCLT()) {
+        unlockableLines.erase(addr);
+        CLTOverflowed = unlockableLines.size() >= GCONFIGS.CLTSize;
+        DPRINTF(NSR, "Erase %#x from CLT\n", addr);
+    }
+    stats.CLTEntries.sample(unlockableLines.size());
+}
+
+template <class Impl>
+void
 LSQUnit<Impl>::checkSnoop(PacketPtr pkt)
 {
     // Should only ever get invalidations in here
@@ -465,6 +633,12 @@ LSQUnit<Impl>::checkSnoop(PacketPtr pkt)
     auto iter = loadQueue.begin();
 
     Addr invalidate_addr = pkt->getAddr() & cacheBlockMask;
+    DPRINTF(NSR, "Trying to invalidate line: %p\n", invalidate_addr);
+    if (IN_MAP(invalidate_addr, YNLC_map)) {
+        DPRINTF(NSR, "[ERROR] trying to invalidate a locked line: %p\n",
+                invalidate_addr);
+    }
+    assert(!IN_MAP(invalidate_addr, YNLC_map));
 
     DynInstPtr ld_inst = iter->instruction();
     assert(ld_inst);
@@ -477,13 +651,24 @@ LSQUnit<Impl>::checkSnoop(PacketPtr pkt)
         TheISA::handleLockedSnoopHit(ld_inst.get());
 
     bool force_squash = false;
-
-    while (++iter != loadQueue.end()) {
+    bool seen_SOS = false;
+    for (; iter != loadQueue.end(); iter++) {
         ld_inst = iter->instruction();
         assert(ld_inst);
         req = iter->request();
-        if (!ld_inst->effAddrValid() || ld_inst->strictlyOrdered())
+
+        if (ld_inst->isUnSquashable() || ld_inst->isCommitted() ||
+            ld_inst->isDataPrefetch()) {
+            // un-squashable, data prefetch, and committed loads are ordered
             continue;
+        } else if (!seen_SOS) {
+            // after skipping all un-squashable, data prefetch, and committed
+            // loads, the first one is the source of speculation
+            seen_SOS = true;
+            continue;
+        } else if (!ld_inst->effAddrValid() || ld_inst->strictlyOrdered()) {
+            continue;
+        }
 
         DPRINTF(LSQUnit, "-- inst [sn:%lli] to pktAddr:%#x\n",
                     ld_inst->seqNum, invalidate_addr);
@@ -503,6 +688,8 @@ LSQUnit<Impl>::checkSnoop(PacketPtr pkt)
                 // Mark the load for re-execution
                 ld_inst->fault = std::make_shared<ReExec>();
                 req->setStateToFault();
+
+                CSPRINT(ReExec, ld_inst, "invalid line: %p\n", invalidate_addr);
             } else {
                 DPRINTF(LSQUnit, "HitExternal Snoop for addr %#x [sn:%lli]\n",
                         pkt->getAddr(), ld_inst->seqNum);
@@ -558,7 +745,9 @@ LSQUnit<Impl>::checkViolations(typename LoadQueue::iterator& loadIt,
                         DPRINTF(LSQUnit, "Detected fault with inst [sn:%lli] "
                                 "and [sn:%lli] at address %#x\n",
                                 inst->seqNum, ld_inst->seqNum, ld_eff_addr1);
+                        ld_inst->setMemViolation();
                         memDepViolator = ld_inst;
+                        assert(!ld_inst->isUnSquashable());
 
                         ++stats.memOrderViolation;
 
@@ -585,7 +774,9 @@ LSQUnit<Impl>::checkViolations(typename LoadQueue::iterator& loadIt,
                 DPRINTF(LSQUnit, "Detected fault with inst [sn:%lli] and "
                         "[sn:%lli] at address %#x\n",
                         inst->seqNum, ld_inst->seqNum, ld_eff_addr1);
+                ld_inst->setMemViolation();
                 memDepViolator = ld_inst;
+                assert(!ld_inst->isUnSquashable());
 
                 ++stats.memOrderViolation;
 
@@ -734,6 +925,14 @@ LSQUnit<Impl>::commitLoad()
     DPRINTF(LSQUnit, "Committing head load instruction, PC %s\n",
             loadQueue.front().instruction()->pcState());
 
+    if (loadQueue.front().instruction()->hasPendingUnlockReq()) {
+        loadQueue.front().instruction()->resetPendingUnlockReq();
+    }
+
+    if (nsrPolicy == PARTITIONED) {
+        removeEntryConflicts(loadQueue.head());
+    }
+
     loadQueue.front().clear();
     loadQueue.pop_front();
 
@@ -746,9 +945,21 @@ LSQUnit<Impl>::commitLoads(InstSeqNum &youngest_inst)
 {
     assert(loads == 0 || loadQueue.front().valid());
 
-    while (loads != 0 && loadQueue.front().instruction()->seqNum
-            <= youngest_inst) {
-        commitLoad();
+    while (loads != 0 &&
+           loadQueue.front().instruction()->seqNum <= youngest_inst) {
+        bool canCommit = true;
+        if (GCONFIGS.delayInvAck) {
+            canCommit = tryUnlockLQEntry(loadQueue.head(), false);
+        }
+
+        if (canCommit) {
+            DSTATE(CommitLoad, loadQueue.front().instruction());
+            commitLoad();
+        } else {
+            DPRINTF(LSQUnit, "Cannot commit head load instruction, PC %#x\n",
+            loadQueue.front().instruction()->instAddr());
+            break;
+        }
     }
 }
 
@@ -773,6 +984,8 @@ LSQUnit<Impl>::commitStores(InstSeqNum &youngest_inst)
                     x.instruction()->seqNum);
 
             x.canWB() = true;
+
+            DSTATE(CanWB, x.instruction());
 
             ++storesToWB;
         }
@@ -805,6 +1018,9 @@ LSQUnit<Impl>::writebackStores()
            storeWBIt->canWB() &&
            ((!needsTSO) || (!storeInFlight)) &&
            lsq->cachePortAvailable(false)) {
+
+        CSPRINT(TryWB, storeWBIt->instruction(), "blocked: %d; addr: %#x\n",
+                isStoreBlocked, storeWBIt->instruction()->physEffAddr);
 
         if (isStoreBlocked) {
             DPRINTF(LSQUnit, "Unable to write back any more stores, cache"
@@ -857,6 +1073,33 @@ LSQUnit<Impl>::writebackStores()
         else
             memcpy(inst->memData, storeWBIt->data(), req->_size);
 
+        if (DTRACE(MemDbg)) {
+            assert(!inst->isSquashed());
+
+            uint64_t data;
+            switch (inst->effSize) {
+            case 1:
+                data = *((uint8_t*)inst->memData);
+                break;
+            case 2:
+                data = *((uint16_t*)inst->memData);
+                break;
+            case 4:
+                data = *((uint32_t*)inst->memData);
+                break;
+            case 8:
+                data = *((uint64_t*)inst->memData);
+                break;
+            default:
+                break;
+            }
+            CCSPRINT(MemDbg, Mem, inst,
+                     "%c: eff: %#x, phy: %#x, size: %u, data: %lu, atomic: %d, sc: %d\n",
+                     inst->typeCode,
+                     inst->effAddr, inst->physEffAddr,
+                     inst->effSize, data, inst->isAtomic(),
+                     inst->isStoreConditional());
+        }
 
         if (req->senderState() == nullptr) {
             SQSenderState *state = new SQSenderState(storeWBIt);
@@ -971,6 +1214,21 @@ LSQUnit<Impl>::squash(const InstSeqNum &squashed_num)
             DPRINTF(HtmCpu, ">> htmStarts (%d) : htmStops-- (%d)\n",
               htmStarts, htmStops);
         }
+        if (loadQueue.back().instruction()->isUnSquashable()) {
+            warn_once("Squashing an un-squashable LQ entry! seqNum: %llu\n",
+                      loadQueue.back().instruction()->seqNum);
+            tryUnlockLQEntry(loadQueue.tail(), true);
+            stats.squashedLocked++;
+        }
+        if (nsrPolicy == PARTITIONED) {
+            removeEntryConflicts(loadQueue.tail());
+        }
+
+        // remove req from delayed buffer
+        if (GCONFIGS.hw == utils::DOM) {
+            delayedReqs.erase(loadQueue.back().request());
+        }
+
         // Clear the smart pointer to make sure it is decremented.
         loadQueue.back().instruction()->setSquashed();
         loadQueue.back().clear();
@@ -1052,6 +1310,19 @@ LSQUnit<Impl>::squash(const InstSeqNum &squashed_num)
         storeQueue.pop_back();
         ++stats.squashedStores;
     }
+
+    vector<int16_t> toErase;
+    for (auto &p : eagerTransBuffer) {
+        auto idx = p.first;
+        auto &inst = storeQueue[idx].instruction();
+        if (inst && inst->seqNum > squashed_num) {
+            toErase.push_back(idx);
+        }
+    }
+
+    for (auto &i : toErase) {
+        eagerTransBuffer.erase(i);
+    }
 }
 
 template <class Impl>
@@ -1065,7 +1336,11 @@ LSQUnit<Impl>::storePostSend()
                 stallingStoreIsn, stallingLoadIdx);
         stalled = false;
         stallingStoreIsn = 0;
-        iewStage->replayMemInst(loadQueue[stallingLoadIdx].instruction());
+        // the stallingLoadIdx could be invalid because
+        // it has been replayed due to a strictly ordered load
+        if (loadQueue[stallingLoadIdx].instruction()) {
+            iewStage->replayMemInst(loadQueue[stallingLoadIdx].instruction());
+        }
     }
 
     if (!storeWBIt->instruction()->isStoreConditional()) {
@@ -1080,6 +1355,7 @@ LSQUnit<Impl>::storePostSend()
     }
 
     if (needsTSO) {
+        DSTATE(StInflight, storeWBIt->instruction());
         storeInFlight = true;
     }
 
@@ -1103,6 +1379,7 @@ LSQUnit<Impl>::writeback(const DynInstPtr &inst, PacketPtr pkt)
         inst->setExecuted();
 
         if (inst->fault == NoFault) {
+            inst->setDataReceived();
             // Complete access to copy data to proper place.
             inst->completeAcc(pkt);
         } else {
@@ -1152,7 +1429,7 @@ template <class Impl>
 void
 LSQUnit<Impl>::completeStore(typename StoreQueue::iterator store_idx)
 {
-    assert(store_idx->valid());
+    assert(store_idx->valid() && store_idx->dataAvail());
     store_idx->completed() = true;
     --storesToWB;
     // A bit conservative because a store completion may not free up entries,
@@ -1199,6 +1476,7 @@ LSQUnit<Impl>::completeStore(typename StoreQueue::iterator store_idx)
     store_inst->setCompleted();
 
     if (needsTSO) {
+        DSTATE(StoreComplete, store_inst);
         storeInFlight = false;
     }
 
@@ -1251,6 +1529,511 @@ LSQUnit<Impl>::trySendPacket(bool isLoad, PacketPtr data_pkt)
         state->request()->packetNotSent();
     }
     return ret;
+}
+
+template <class Impl>
+bool
+LSQUnit<Impl>::unlockBufferRetry() {
+    bool allSent = true;
+    std::vector<Addr> toErase;
+
+    for (auto line : NSRUnlockBuffer) {
+        bool notMemAddr = false;
+        if (trySendNSR(line, false, notMemAddr)) {
+            toErase.push_back(line);
+        } else {
+            allSent = false;
+            assert(!notMemAddr);
+            break;
+        }
+    }
+
+    // clear those have been sent
+    for (auto line : toErase) {
+        NSRUnlockBuffer.erase(line);
+    }
+
+    return allSent;
+}
+
+template <class Impl>
+bool
+LSQUnit<Impl>::tryLockLQEntry(uint32_t idx, bool isPreLock) {
+    auto entry = loadQueue.getIterator(idx);
+    auto &inst = entry->instruction();
+    bool allSent = true;
+
+    CSPRINT(Lock, inst, "addr: %#x; prelock: %d\n", inst->physEffAddr, isPreLock);
+
+    if (!entry->request()) {
+        return false;
+    }
+
+    for (auto &r : entry->request()->_requests) {
+        if (r->hasPaddr()) {
+            Addr line = r->getPaddr() & cacheBlockMask;
+
+            if (checkCLT(line)) {
+                allSent = false;
+                break;
+            }
+
+            if (IN_SET(line, YNLC_map)) {
+                // already locked, just propagate
+                CCSPRINT(NSR, LockedLinePropagation, inst, "; line: %#x\n", line);
+                YNLC_map[line] = entry;
+            } else if (IN_SET(line, NSRUnlockBuffer)) {
+                // has pending unlock request, no need to send both
+                CCSPRINT(NSR, UnlockBufferHit, inst, "; line: %#x\n", line);
+                NSRUnlockBuffer.erase(line);
+                YNLC_map[line] = entry;
+            } else {
+                // needs to send NSR Lock
+                bool notMemAddr = false;
+                CCSPRINT(NSR, LineLocking, inst, "; line: %#x\n", line);
+                if (trySendNSR(line, true, notMemAddr, isPreLock)) {
+                    // succeed
+                    YNLC_map[line] = entry;
+                } else {
+                    allSent = false;
+                    if (notMemAddr) {
+                        // stop sending NSR for this instruction
+                        // because it is not accessing
+                        inst->setNotMemAddr();
+                    }
+                    break;
+                }
+            }
+        } else {
+            allSent = false;
+            break;
+        }
+    }
+
+    return allSent;
+}
+
+template <class Impl>
+bool
+LSQUnit<Impl>::tryUnlockLQEntry(uint32_t idx, bool addToRetry) {
+    auto entry = loadQueue.getIterator(idx);
+    auto &inst = entry->instruction();
+    bool allSent = true;
+
+    CSPRINT(Unlock, inst, "addr: %#x;\n", inst->physEffAddr);
+
+    if (!entry->request()) {
+        return false;
+    }
+
+    for (auto &r : entry->request()->_requests) {
+        if (r->hasPaddr()) {
+            Addr line = r->getPaddr() & cacheBlockMask;
+
+            if (IN_MAP(line, YNLC_map) &&
+                YNLC_map.at(line) == entry) {
+                // the entry is the YNLC of line
+
+                bool notMemAddr = false;
+                if (trySendNSR(line, false, notMemAddr)) {
+                    // succeed
+                    YNLC_map.erase(line);
+                } else {
+                    allSent = false;
+                    assert(!notMemAddr);
+                    if (addToRetry) {
+                        NSRUnlockBuffer.insert(line);
+                        // because YNLC is going to commit soon, cannot keep it
+                        YNLC_map.erase(line);
+                    } else {
+                        // set its instruction as unlock pending, before it retires
+                        inst->setPendingUnlockReq();
+                    }
+                    break;
+                }
+            }
+        } else {
+            continue;
+        }
+    }
+
+    return allSent;
+}
+
+template <class Impl>
+bool
+LSQUnit<Impl>::trySendNSR(Addr address, bool lock, bool &notMemAddr,
+                          bool isPreLock) {
+    bool ret;
+    auto request = std::make_shared<Request>(
+        address, 1, 0, Request::funcRequestorId);
+    request->setContext(cpu->thread[lsqID]->contextId());
+
+    Packet pkt(request, lock ? MemCmd::SetUnSquashable :
+                               MemCmd::ClearUnSquashable);
+
+    if (isPreLock) {
+        pkt.setPreLock();
+    }
+
+    if (lsq->cachePortAvailable(true) &&
+        dcachePort->sendTimingReq(&pkt)) {
+        ret = true;
+    } else {
+        ret = false;
+    }
+
+    if (lock) {
+        DPRINTF(NSR, "LSQUnit tries to lock %#x; succeed: %d\n", address, ret);
+        if (ret) stats.NSRLockingReq++;
+    } else {
+        DPRINTF(NSR, "LSQUnit tries to unlock %#x; succeed: %d\n", address, ret);
+        if (ret) stats.NSRUnlockingReq++;
+    }
+
+    if (!ret && pkt.notInMemAddr()) {
+        notMemAddr = true;
+    }
+
+    return ret;
+}
+
+template <class Impl>
+bool
+LSQUnit<Impl>::markUnSquashables() {
+    assert(GCONFIGS.threatModel == utils::Comprehensive);
+
+    unlockBufferRetry();
+
+    if (nsrPolicy == PARTITIONED && CSTBlocked) {
+        return false;
+    }
+
+    auto storeCheck = [](LQIterator iter) {
+        if (GCONFIGS.ISA == utils::X86) {
+            uint32_t flags = iter->request()->mainRequest()->getFlags();
+            bool storeCheck = flags &
+                    (X86ISA::StoreCheck << X86ISA::FlagShift);
+            return storeCheck;
+        } else {
+            return false;
+        }
+    };
+
+    bool locked = true, hasPending = false;
+    uint32_t locked_cnt = 0;
+    for (auto iter = loadQueue.begin(); iter != loadQueue.end() && locked; iter++, locked_cnt++) {
+        assert(iter->valid());
+        DynInstPtr inst = iter->instruction();
+
+        // ignore data prefetch and locked
+        if (inst->isDataPrefetch() || inst->isUnSquashable() ||
+            inst->isCommitted()) {
+            locked = true;
+            continue;
+        }
+
+        // start of locking condiction checking
+        bool canLock = true;
+        if (!inst->isReachedVP()) {
+            canLock = false;
+            stats.NSRUnlockVP += 1;
+        }
+
+        if (inst->isUnderExcept() || inst->getFault() != NoFault ||
+            inst->hasMemViolation()) {
+            canLock = false;
+            stats.NSRUnlockException += 1;
+            stats.NSRUnlockVP -= 1; // under exception implies not reaching VP
+        }
+
+        if (!inst->effAddrValid()) {
+            canLock = false;
+            stats.NSRUnlockAddr += 1;
+            stats.NSRUnlockException -= 1; // effAddr not valid implies under exception
+        }
+
+        // check Store Queue space to avoid deadlock
+        // it is an over-approximation of checking Store Buffer's room
+        if (storeQueue.full() &&
+            iter->instruction()->sqIt == storeQueue.getIterator(storeQueue.tail())) {
+            canLock = false;
+            stats.NSRUnlockSB += 1;
+        }
+
+        if (iter->hasRequest() &&
+            iter->request()->mainRequest()->isLockedRMW()) {
+            canLock = false;
+            stats.NSRUnlockRMW += 1;
+        }
+
+        // policy dependent checking
+        switch (nsrPolicy) {
+            case STRICT:
+                if (!inst->isDataReceived()) {
+                    canLock = false;
+                    stats.NSRUnlockDataRecv += 1;
+                }
+                break;
+
+            case PARTITIONED:
+                if (iter->hasRequest() && storeCheck(iter)) {
+                    canLock = false;
+                }
+
+                if (checkEntryConflicts(iter.idx())) {
+                    canLock = false;
+                    stats.NSRUnlockConflicts += 1;
+                    inst->setHasConflict();
+                } else {
+                    inst->resetHasConflict();
+                }
+                break;
+
+            default:
+                panic("Unknown NSR policy");
+        }
+
+        if (canLock) {
+            switch (nsrPolicy) {
+                case STRICT:
+                    locked = tryLockLQEntry(iter.idx());
+                    hasPending = hasPending || !locked;
+                    break;
+
+                case PARTITIONED:
+                    locked = tryLockLQEntry(iter.idx(), true);
+                    hasPending = hasPending || !locked;
+                    break;
+
+                default:
+                    panic("Unknown NSR policy");
+            }
+        } else {
+            locked = false;
+        }
+
+        if (locked) {
+            if (!iter->isUnSquashable()) {
+                iter->setUnSquashable();
+                stats.unSquashables++;
+            }
+        }
+    }
+
+    stats.lockedLQEntryNum.sample(locked_cnt);
+
+    return hasPending;
+}
+
+template <class Impl>
+uint64_t
+LSQUnit<Impl>::getL1DConflictID(Addr address, bool hash) const {
+    assert(nsrPolicy == PARTITIONED);
+
+    auto sid = addressToL1DCacheSet(address);
+    if (!hash) {
+        return sid;
+    } else {
+        return sid % GCONFIGS.L1DCSTEntryCnt;
+    }
+}
+
+template <class Impl>
+uint64_t
+LSQUnit<Impl>::getL2ConflictID(Addr address, bool hash) const {
+    assert(nsrPolicy == PARTITIONED);
+    uint32_t set = addressToL2CacheSet(address);
+    uint32_t slice = addressToLLCHaswell(address);
+    uint64_t sid = ((uint64_t)slice << 32) + set;
+    if (!hash) {
+        return sid;
+    } else {
+        return (sid ^ (sid >> 8) ^ (sid >> 16)) % GCONFIGS.L2CSTEntryCnt;
+    }
+}
+
+template <class Impl>
+bool
+LSQUnit<Impl>::checkEntryConflicts(uint32_t idx) {
+    assert(nsrPolicy == PARTITIONED);
+    bool conflict = false;
+    auto entry = loadQueue.getIterator(idx);
+    auto &inst = entry->instruction();
+
+    if (!entry->request()) {
+        return true;
+    }
+
+    for (auto &r : entry->request()->_requests) {
+        if (r->hasPaddr()) {
+            Addr line = r->getPaddr() & cacheBlockMask;
+            if (checkConflicts(line, inst->seqNum)) {
+                conflict = true;
+                CSTBlocked = true;
+                break;
+            }
+        } else {
+            return true;
+        }
+    }
+
+    if (DTRACE(ROBDump)) {
+        inst->line_accessed = inst->physEffAddr & cacheBlockMask;
+        inst->l1_set = addressToL1DCacheSet(inst->line_accessed);
+        inst->l2_set = addressToL2CacheSet(inst->line_accessed);
+        inst->l2_slice = addressToLLCHaswell(inst->line_accessed);
+    }
+
+    return conflict;
+}
+
+template <class Impl>
+bool
+LSQUnit<Impl>::checkConflicts(Addr line, InstSeqNum seqNum) {
+    assert(nsrPolicy == PARTITIONED);
+    bool useCAM = GCONFIGS.entryUseCAM;
+    uint64_t l1dHash = getL1DConflictID(line, !useCAM), l2Hash = getL2ConflictID(line, !useCAM);
+    uint64_t l1dSID = getL1DConflictID(line, false), l2SID = getL2ConflictID(line, false);
+    stats.NSRConflictChecks += 1;
+
+    bool l1dOverflow = false, l1dTagMiss = false, l1dHashCol = false;
+    bool l1dNoConflict = L1DCST->check_and_insert(line, l1dHash, l1dSID, seqNum,
+                                    l1dOverflow, l1dTagMiss, l1dHashCol);
+
+    if (!l1dNoConflict) {
+        stats.NSRL1Conflicts += 1;
+    }
+
+    if (l1dOverflow) {
+        stats.L1DCSTOverflow += 1;
+    } else {
+        stats.L1DCSTEntries.sample(L1DCST->get_entry_num());
+    }
+
+    if (l1dTagMiss) {
+        stats.L1DCSTTagMiss += 1;
+        if (!l1dNoConflict) {
+            stats.L1DCSTTagMissConf += 1;
+        }
+    }
+
+    if (l1dHashCol) {
+        stats.L1DCSTHashCollision += 1;
+        if (!l1dNoConflict) {
+            stats.L1DCSTHashColConf += 1;
+        }
+    }
+
+    bool l2Overflow = false, l2TagMiss = false, l2HashCol = false;
+    bool l2NoConflict = L2CST->check_and_insert(line, l2Hash, l2SID, seqNum,
+                                    l2Overflow, l2TagMiss, l2HashCol);
+
+    if (!l2NoConflict) {
+        stats.NSRLLCConflicts += 1;
+    }
+
+    if (l2Overflow) {
+        stats.L2CSTOverflow += 1;
+    } else {
+        stats.L2CSTEntries.sample(L2CST->get_entry_num());
+    }
+
+    if (l2TagMiss) {
+        stats.L2CSTTagMiss += 1;
+        if (!l2NoConflict) {
+            stats.L2CSTTagMissConf += 1;
+        }
+    }
+
+    if (l2HashCol) {
+        stats.L2CSTHashCollision += 1;
+        if (!l2NoConflict) {
+            stats.L2CSTHashColConf += 1;
+        }
+    }
+
+    if (!(l1dNoConflict && l2NoConflict)) {
+        stats.NSRConflicts += 1;
+        return true; // has conflicts
+    } else {
+        return false;
+    }
+}
+
+template <class Impl>
+void
+LSQUnit<Impl>::removeEntryConflicts(uint32_t idx) {
+    assert(nsrPolicy == PARTITIONED);
+    auto entry = loadQueue.getIterator(idx);
+    auto &inst = entry->instruction();
+
+    if (!entry->request()) {
+        return;
+    }
+
+    CSTBlocked = false;
+    bool useCAM = GCONFIGS.entryUseCAM;
+    for (auto &r : entry->request()->_requests) {
+        if (r->hasPaddr()) {
+            Addr line = r->getPaddr() & cacheBlockMask;
+            L1DCST->commit_or_squash(line, getL1DConflictID(line, !useCAM), inst->seqNum);
+            L2CST->commit_or_squash(line, getL2ConflictID(line, !useCAM), inst->seqNum);
+        }
+    }
+    return;
+}
+
+template <class Impl>
+void
+LSQUnit<Impl>::issueEagerTranslated() {
+    vector<int16_t> toErase;
+    for (auto &p : eagerTransBuffer) {
+        auto idx = p.first;
+        auto waitingList = p.second;
+
+        auto &inst = storeQueue[idx].instruction();
+        if (!inst) {
+            // the entry is squashed
+            toErase.push_back(idx);
+            continue;
+        }
+        assert(inst->isEagerTranslated());
+        if (inst->numSrcRegs() == inst->readyRegs || inst->isSquashed()) {
+            if (!inst->isSquashed()) {
+                inst->setStoreData();
+                assert(storeQueue[idx].dataAvail());
+                for (auto &load_inst : *waitingList) {
+                    if (!load_inst->isSquashed() && load_inst->lqIt->request()) {
+                        read(load_inst->lqIt->request(), load_inst->lqIdx);
+                    }
+                }
+            }
+            toErase.push_back(idx);
+        }
+    }
+
+    for (auto &i : toErase) {
+        eagerTransBuffer.erase(i);
+    }
+}
+
+template <class Impl>
+Fault
+LSQUnit<Impl>::setMemData(const DynInstPtr& inst, uint8_t *data) {
+    auto idx = inst->sqIdx;
+    auto size = storeQueue[idx].size();
+    LSQRequest *req = storeQueue[idx].request();
+
+    assert((!(req->request()->getFlags() & Request::CACHE_BLOCK_ZERO) &&
+            !req->request()->isCacheMaintenance() &&
+            !req->request()->isAtomic()));
+
+    memcpy(storeQueue[idx].data(), data, size);
+    req->resetEagerTranslated();
+    storeQueue[idx].setDataAvail();
+
+    return NoFault;
 }
 
 template <class Impl>

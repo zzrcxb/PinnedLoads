@@ -87,6 +87,9 @@ def setCPUClass(options):
         CPUClass = TmpClass
         TmpClass = AtomicSimpleCPU
         test_mem_mode = 'atomic'
+    else:
+        CPUClass = TmpClass
+        TmpClass, test_mem_mode = getCPUClass(options.restore_with_cpu)
 
     # Ruby only supports atomic accesses in noncaching mode
     if test_mem_mode == 'atomic' and options.ruby:
@@ -148,6 +151,11 @@ def findCptDir(options, cptdir, testsys):
             inst += int(testsys.cpu[0].workload[0].simpoint)
 
         checkpoint_dir = joinpath(cptdir, "cpt.%s.%s" % (options.bench, inst))
+
+        if options.simpt_ckpt is not None:
+            checkpoint_dir = joinpath(
+                cptdir, "cpt.%s.SIMP-%d" % (options.bench, options.simpt_ckpt))
+
         if not exists(checkpoint_dir):
             fatal("Unable to find checkpoint directory %s", checkpoint_dir)
 
@@ -471,6 +479,9 @@ def run(options, root, testsys, cpu_class):
     if cpu_class:
         switch_cpus = [cpu_class(switched_out=True, cpu_id=(i))
                        for i in range(np)]
+
+        if cpu_class == DerivO3CPU:
+            CpuConfig.config_O3CPU(cpu_class, switch_cpus, options)
 
         for i in range(np):
             if options.fast_forward:

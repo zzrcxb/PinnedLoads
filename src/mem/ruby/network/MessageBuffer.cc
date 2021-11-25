@@ -47,6 +47,7 @@
 #include "base/random.hh"
 #include "base/stl_helpers.hh"
 #include "debug/RubyQueue.hh"
+#include "debug/RubyTracer.hh"
 #include "mem/ruby/system/RubySystem.hh"
 
 using namespace std;
@@ -68,6 +69,7 @@ MessageBuffer::MessageBuffer(const Params *p)
     m_priority_rank = 0;
 
     m_stall_msg_map.clear();
+    m_replay_msg_map.clear();
     m_input_link_id = 0;
     m_vnet_id = 0;
 
@@ -392,6 +394,44 @@ MessageBuffer::stallMessage(Addr addr, Tick current_time)
     (m_stall_msg_map[addr]).push_back(message);
     m_stall_map_size++;
     m_stall_count++;
+}
+
+void
+MessageBuffer::moveToReplay(Addr addr, Tick current_time) {
+    DPRINTF(RubyTracer, "Added %#x to replay list\n", addr);
+    assert(isReady(current_time));
+    assert(getOffset(addr) == 0);
+    MsgPtr message = m_prio_heap.front();
+
+    dequeue(current_time, false);
+
+    (m_replay_msg_map[addr]).push_back(message);
+}
+
+void
+MessageBuffer::recycleReplayMsg(Addr addr, Tick current_time, Tick recycle_latency) {
+    assert(m_replay_msg_map.find(addr) != m_replay_msg_map.end());
+    assert(m_replay_msg_map[addr].size() == 1);
+    DPRINTF(RubyTracer, "Recycled %#x from replay list\n", addr);
+
+    MsgPtr node = m_replay_msg_map[addr].front();
+    Tick future_time = current_time + recycle_latency;
+    node->setLastEnqueueTime(future_time);
+
+    m_prio_heap.push_back(node);
+    push_heap(m_prio_heap.begin(), m_prio_heap.end(), greater<MsgPtr>());
+    m_consumer->scheduleEventAbsolute(future_time);
+
+    m_replay_msg_map.erase(addr);
+}
+
+void
+MessageBuffer::dropReplay(Addr addr, Tick current_time) {
+    assert(m_replay_msg_map.find(addr) != m_replay_msg_map.end());
+    assert(m_replay_msg_map[addr].size() == 1);
+    DPRINTF(RubyTracer, "Dropped %#x from replay list\n", addr);
+
+    m_replay_msg_map.erase(addr);
 }
 
 bool

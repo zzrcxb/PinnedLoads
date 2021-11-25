@@ -60,6 +60,9 @@ structure(InPort, external = "yes", primitive="yes") {
   bool isReady(Tick current_time);
   Tick dequeue(Tick current_time);
   void recycle(Tick current_time, Tick recycle_latency);
+  void moveToReplay(Addr addr, Tick current_time);
+  void recycleReplayMsg(Addr addr, Tick current_time, Tick recycle_latency);
+  void dropReplay(Addr addr, Tick current_time);
   bool isEmpty();
   bool isStallMapEmpty();
   int getStallMapSize();
@@ -67,7 +70,12 @@ structure(InPort, external = "yes", primitive="yes") {
 }
 
 external_type(NodeID, default="0", primitive="yes");
-external_type(MachineID);
+
+structure(MachineID, external = "yes") {
+  NodeID getNum();
+  MachineType getType();
+  std::string toString();
+}
 
 structure (Set, external = "yes", non_obj="yes") {
   void setSize(int);
@@ -123,6 +131,12 @@ structure (Sequencer, external = "yes") {
   void readCallback(Addr, DataBlock, bool, MachineType,
                     Cycles, Cycles, Cycles);
 
+  void specReadCallback(Addr);
+  void specReadCallback(Addr, DataBlock);
+  void specReadCallback(Addr, DataBlock, bool);
+  void specReadCallback(Addr, DataBlock, bool, bool,
+                        MachineType, Cycles, Cycles, Cycles);
+
   void writeCallback(Addr, DataBlock);
   void writeCallback(Addr, DataBlock, bool);
   void writeCallback(Addr, DataBlock, bool, MachineType);
@@ -135,6 +149,10 @@ structure (Sequencer, external = "yes") {
   void llscClearLocalMonitor();
 
   void evictionCallback(Addr);
+  void deferCallback(Addr);
+  void resetCallback(Addr);
+  void updateCLT(Addr, bool);
+  void updateDelayedInvStat(bool, bool);
   void recordRequestType(SequencerRequestType);
   bool checkResourceAvailable(CacheResourceType, Addr);
 }
@@ -164,6 +182,9 @@ structure(RubyRequest, desc="...", interface="Message", external="yes") {
 
 structure(AbstractCacheEntry, primitive="yes", external = "yes") {
   void changePermission(AccessPermission);
+  void addSharers(int);
+  void removeSharers(int);
+  void resetSharers();
 }
 
 structure (DirectoryMemory, external = "yes") {
@@ -177,14 +198,18 @@ structure (DirectoryMemory, external = "yes") {
 
 structure (CacheMemory, external = "yes") {
   bool cacheAvail(Addr);
+  bool cacheAvail(Addr, NodeID);
   Addr cacheProbe(Addr);
+  Addr cacheProbe(Addr, NodeID);
   AbstractCacheEntry getNullEntry();
   AbstractCacheEntry allocate(Addr, AbstractCacheEntry);
+  AbstractCacheEntry allocate(Addr, AbstractCacheEntry, NodeID);
   AbstractCacheEntry allocate(Addr, AbstractCacheEntry, bool);
   void allocateVoid(Addr, AbstractCacheEntry);
   void deallocate(Addr);
   AbstractCacheEntry lookup(Addr);
   bool isTagPresent(Addr);
+  bool isUnSquashable(Addr address);
   Cycles getTagLatency();
   Cycles getDataLatency();
   void setMRU(Addr);

@@ -44,6 +44,7 @@
 #include <iostream>
 #include <list>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "mem/ruby/common/Address.hh"
 #include "mem/ruby/protocol/MachineType.hh"
@@ -52,6 +53,7 @@
 #include "mem/ruby/structures/CacheMemory.hh"
 #include "mem/ruby/system/RubyPort.hh"
 #include "params/RubySequencer.hh"
+#include "cpu/global_utils.hh"
 
 struct SequencerRequest
 {
@@ -113,6 +115,17 @@ class Sequencer : public RubyPort
                       const Cycles forwardRequestTime = Cycles(0),
                       const Cycles firstResponseTime = Cycles(0));
 
+    void specReadCallback(Addr address);
+
+    void specReadCallback(Addr address,
+                      DataBlock& data,
+                      const bool specMiss = false,
+                      const bool externalHit = false,
+                      const MachineType mach = MachineType_NUM,
+                      const Cycles initialRequestTime = Cycles(0),
+                      const Cycles forwardRequestTime = Cycles(0),
+                      const Cycles firstResponseTime = Cycles(0));
+
     RequestStatus makeRequest(PacketPtr pkt) override;
     virtual bool empty() const;
     int outstandingCount() const override { return m_outstanding_count; }
@@ -127,6 +140,13 @@ class Sequencer : public RubyPort
 
     void markRemoved();
     void evictionCallback(Addr address);
+    void updateCLT(Addr address, bool insert);
+    void updateCLT(Addr address, bool insert, bool internal);
+    void updateDelayedInvStat(bool isInvalidation, bool isPrefetch);
+    bool setUnSquashable(Addr address, bool preLock=false);
+    bool clearUnSquashable(Addr address);
+    bool isUnSquashable(Addr address);
+
     int coreId() const { return m_coreId; }
 
     virtual int functionalWrite(Packet *func_pkt) override;
@@ -186,7 +206,8 @@ class Sequencer : public RubyPort
                      const MachineType mach, const bool externalHit,
                      const Cycles initialRequestTime,
                      const Cycles forwardRequestTime,
-                     const Cycles firstResponseTime);
+                     const Cycles firstResponseTime,
+                     const bool specL1Miss=false);
 
     void recordMissLatency(SequencerRequest* srequest, bool llscSuccess,
                            const MachineType respondingMach,
@@ -201,6 +222,18 @@ class Sequencer : public RubyPort
   protected:
     // RequestTable contains both read and write requests, handles aliasing
     std::unordered_map<Addr, std::list<SequencerRequest>> m_RequestTable;
+
+    // Speculative request table
+    std::unordered_map<Addr, std::list<SequencerRequest>> s_RequestTable;
+
+    // Locked loads request table
+    std::unordered_map<Addr, std::list<SequencerRequest>> l_RequestTable;
+
+    // Write request table
+    std::unordered_map<Addr, std::list<SequencerRequest>> w_RequestTable;
+
+    // Pre-lock buffer
+    std::unordered_set<Addr> preLockBuffer;
 
     Cycles m_deadlock_threshold;
 
@@ -228,6 +261,9 @@ class Sequencer : public RubyPort
     int m_coreId;
 
     bool m_runningGarnetStandalone;
+
+    Stats::Scalar specRubyReadCnt, specL1MissCnt;
+    Stats::Scalar delayedInvalidations, delayedEvictions, droppedPrefetches;
 
     //! Histogram for number of outstanding requests per cycle.
     Stats::Histogram m_outstandReqHist;

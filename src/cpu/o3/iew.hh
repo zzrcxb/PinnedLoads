@@ -51,6 +51,7 @@
 #include "cpu/timebuf.hh"
 #include "debug/IEW.hh"
 #include "sim/probe/probe.hh"
+#include "cpu/global_utils.hh"
 
 struct DerivO3CPUParams;
 class FUPool;
@@ -298,6 +299,9 @@ class DefaultIEW
     /** Sorts instructions coming from rename into lists separated by thread. */
     void sortInsts();
 
+    /** Retries WB deferred instructions */
+    void retryWB(ThreadID tid);
+
   public:
     /** Ticks IEW stage, causing Dispatch, the IQ, the LSQ, Execute, and
      * Writeback to run for one cycle.
@@ -343,6 +347,9 @@ class DefaultIEW
 
     /** Queue of all instructions coming from rename this cycle. */
     std::queue<DynInstPtr> insts[Impl::MaxThreads];
+
+    /** Buffer for wb delayed instructions */
+    std::list<DynInstPtr> WBDeferred[Impl::MaxThreads];
 
     /** Skid buffer between rename and IEW. */
     std::queue<DynInstPtr> skidBuffer[Impl::MaxThreads];

@@ -34,6 +34,7 @@
 #include "mem/ruby/common/NetDest.hh"
 #include "mem/ruby/protocol/MachineType.hh"
 #include "mem/ruby/structures/DirectoryMemory.hh"
+#include <unordered_map>
 
 inline NetDest
 broadcast(MachineType type)
@@ -56,6 +57,47 @@ mapAddressToRange(Addr addr, MachineType type, int low_bit,
     else
         mach.num = bitSelect(addr, low_bit, low_bit + num_bits - 1)
             + (1 << num_bits) * cluster_id;
+    return mach;
+}
+
+inline MachineID
+addressToLLCHaswell(Addr addr, MachineType mtype)
+{
+    static std::unordered_map<Addr, uint> _map_cache;
+    assert(mtype == MachineType_L2Cache);
+    warn_once("Using Haswell LLC mapping hash.\n");
+
+    MachineID mach = {mtype, 0};
+
+    if (_map_cache.find(addr) != _map_cache.end()) {
+        mach.num = _map_cache.at(addr);
+        return mach;
+    }
+
+    std::vector<uint> hash0 = {17, 18, 20, 22, 24, 25, 26, 27, 28, 30, 32};
+    std::vector<uint> hash1 = {19, 22, 23, 26, 27, 30, 31};
+    std::vector<uint> hash2 = {17, 20, 21, 24, 27, 28, 29, 30};
+
+    uint tmp;
+
+    tmp =0;
+    for (auto i : hash2)
+        tmp  ^= ((addr>>i) & 1);
+    mach.num |= ((tmp &1)<<2);
+
+    tmp =0;
+    for (auto i : hash1)
+        tmp  ^= ((addr>>i) & 1);
+    mach.num |= ((tmp &1)<<1);
+
+    tmp =0;
+    for (auto i : hash0)
+        tmp  ^= ((addr>>i) & 1);
+    mach.num |= (tmp &1);
+
+    assert(MachineType_base_count(mtype) <= 8);
+    mach.num %= MachineType_base_count(mtype);
+
     return mach;
 }
 

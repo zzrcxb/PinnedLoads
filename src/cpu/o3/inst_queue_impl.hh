@@ -56,6 +56,7 @@
 // clang complains about std::set being overloaded with Packet::set if
 // we open up the entire namespace std
 using std::list;
+using bridge::GCONFIGS;
 
 template <class Impl>
 InstructionQueue<Impl>::FUCompletion::FUCompletion(const DynInstPtr &_inst,
@@ -177,6 +178,22 @@ void
 InstructionQueue<Impl>::regStats()
 {
     using namespace Stats;
+
+    iqInstsFenced
+        .name(name() + ".iqInstsFenced")
+        .desc("Number of instructions that are fenced by FENCE")
+        .prereq(iqInstsFenced);
+
+    iqMemInstsFenced
+        .name(name() + ".iqMemInstsFenced")
+        .desc("Number of memory instructions that are fenced by FENCE")
+        .prereq(iqMemInstsFenced);
+
+    iqGenericInstsFenced
+        .name(name() + ".iqGenericInstsFenced")
+        .desc("Number of non-memory instructions that are fenced by FENCE")
+        .prereq(iqGenericInstsFenced);
+
     iqInstsAdded
         .name(name() + ".iqInstsAdded")
         .desc("Number of instructions added to the IQ (excludes non-spec)")
@@ -424,6 +441,8 @@ InstructionQueue<Impl>::resetState()
     nonSpecInsts.clear();
     listOrder.clear();
     deferredMemInsts.clear();
+    fencedMemInsts.clear();
+    fencedGenericInsts.clear();
     blockedMemInsts.clear();
     retryMemInsts.clear();
     wbOutstanding = 0;
@@ -779,7 +798,16 @@ InstructionQueue<Impl>::scheduleReadyInsts()
 
     DynInstPtr mem_inst;
     while (mem_inst = std::move(getDeferredMemInstToExecute())) {
+        if (mem_inst->isEagerIssued()) {
+            // clear EagerIssued so it can be issued again
+            mem_inst->resetEagerIssued();
+        }
         addReadyMemInst(mem_inst);
+    }
+
+    if (GCONFIGS.hw == utils::FENCE || GCONFIGS.hw == utils::STT) {
+        getFencedMemInstToExecute();
+        getFencedGenericInstToExecute();
     }
 
     // See if any cache blocked instructions are able to be executed
@@ -929,7 +957,8 @@ InstructionQueue<Impl>::scheduleReadyInsts()
     // @todo If the way deferred memory instructions are handeled due to
     // translation changes then the deferredMemInsts condition should be removed
     // from the code below.
-    if (total_issued || !retryMemInsts.empty() || !deferredMemInsts.empty()) {
+    if (total_issued || !retryMemInsts.empty() || !deferredMemInsts.empty() ||
+        !fencedMemInsts.empty() || !fencedGenericInsts.empty()) {
         cpu->activityThisCycle();
     } else {
         DPRINTF(IQ, "Not able to schedule any instructions.\n");
@@ -1058,11 +1087,22 @@ InstructionQueue<Impl>::wakeDependents(const DynInstPtr &completed_inst)
             DPRINTF(IQ, "Waking up a dependent instruction, [sn:%llu] "
                     "PC %s.\n", dep_inst->seqNum, dep_inst->pcState());
 
-            // Might want to give more information to the instruction
-            // so that it knows which of its source registers is
-            // ready.  However that would mean that the dependency
-            // graph entries would need to hold the src_reg_idx.
-            dep_inst->markSrcRegReady();
+            if (GCONFIGS.hw == utils::STT && completed_inst->isDestTainted()) {
+                dep_inst->setYRoT(completed_inst);
+            }
+
+            // match src reg with des reg to search for corresponding src reg
+            bool marked = false;
+            for (size_t idx = 0; idx < dep_inst->numSrcRegs() && !marked; idx++) {
+                if (dep_inst->isReadySrcRegIdx(idx)) continue;
+
+                if (dep_inst->renamedSrcRegIdx(idx)->flatIndex() ==
+                    dest_reg->flatIndex()) {
+                    dep_inst->markSrcRegReady(idx);
+                    marked = true;
+                }
+            }
+            assert(marked);
 
             addIfReady(dep_inst);
 
@@ -1086,6 +1126,16 @@ template <class Impl>
 void
 InstructionQueue<Impl>::addReadyMemInst(const DynInstPtr &ready_inst)
 {
+    CSPRINT(AddMemReady, ready_inst, "src: %d; ready: %d; can_issue: %d; can_Eager: %d\n",
+            ready_inst->numSrcRegs(), ready_inst->readyRegs, ready_inst->readyToIssue(),
+            ready_inst->canEagerTranslation());
+    if (ready_inst->isEagerIssued()) return; // already issued
+
+    if (ready_inst->readyToIssue() && ready_inst->canEagerTranslation()) {
+        // not all regs are ready when issued
+        ready_inst->setEagerIssued();
+    }
+
     OpClass op_class = ready_inst->opClass();
 
     readyInsts[op_class].push(ready_inst);
@@ -1135,6 +1185,34 @@ InstructionQueue<Impl>::deferMemInst(const DynInstPtr &deferred_inst)
 
 template <class Impl>
 void
+InstructionQueue<Impl>::fenceMemInst(const DynInstPtr &fenced_inst) {
+    assert(fenced_inst->isSpeculative() && !fenced_inst->isReachedESP() &&
+           fenced_inst->isMemRef() && !fenced_inst->isSquashed() &&
+           fenced_inst->isTransmitter());
+
+    DSTATE(MemInstFenced, fenced_inst);
+    fenced_inst->setProtected();
+    fencedMemInsts.push_back(fenced_inst);
+    iqInstsFenced++;
+    iqMemInstsFenced++;
+}
+
+template <class Impl>
+void
+InstructionQueue<Impl>::fenceGenericInst(const DynInstPtr &fenced_inst) {
+    assert(fenced_inst->isSpeculative() && !fenced_inst->isReachedESP() &&
+           !fenced_inst->isMemRef() && !fenced_inst->isSquashed() &&
+           fenced_inst->isTransmitter());
+
+    DSTATE(GenericInstFenced, fenced_inst);
+    fenced_inst->setProtected();
+    fencedGenericInsts.push_back(fenced_inst);
+    iqInstsFenced++;
+    iqGenericInstsFenced++;
+}
+
+template <class Impl>
+void
 InstructionQueue<Impl>::blockMemInst(const DynInstPtr &blocked_inst)
 {
     blocked_inst->clearIssued();
@@ -1164,6 +1242,36 @@ InstructionQueue<Impl>::getDeferredMemInstToExecute()
         }
     }
     return nullptr;
+}
+
+template <class Impl>
+void
+InstructionQueue<Impl>::getFencedMemInstToExecute() {
+    for (ListIt it = fencedMemInsts.begin(); it != fencedMemInsts.end(); it++) {
+        if (!(*it)->isSpeculative() || (*it)->isReachedESP() || (*it)->isSquashed()) {
+            DynInstPtr inst = std::move(*it);
+            if (!inst->isSquashed()) {
+                DSTATE(MemInstFenceLifted, inst);
+            }
+            addReadyMemInst(inst);
+            fencedMemInsts.erase(it--);
+        }
+    }
+}
+
+template <class Impl>
+void
+InstructionQueue<Impl>::getFencedGenericInstToExecute() {
+    for (ListIt it = fencedGenericInsts.begin(); it != fencedGenericInsts.end(); it++) {
+        if (!(*it)->isSpeculative() || (*it)->isReachedESP() || (*it)->isSquashed()) {
+            DynInstPtr inst = std::move(*it);
+            if (!inst->isSquashed()) {
+                DSTATE(GenericInstFenceLifted, inst);
+            }
+            addIfReady(inst);
+            fencedGenericInsts.erase(it--);
+        }
+    }
 }
 
 template <class Impl>
@@ -1238,9 +1346,8 @@ InstructionQueue<Impl>::doSquash(ThreadID tid)
             continue;
         }
 
-        if (!squashed_inst->isIssued() ||
-            (squashed_inst->isMemRef() &&
-             !squashed_inst->memOpDone())) {
+        if (!squashed_inst->isIssued() || squashed_inst->isEagerIssued() ||
+            (squashed_inst->isMemRef() && !squashed_inst->memOpDone())) {
 
             DPRINTF(IQ, "[tid:%i] Instruction [sn:%llu] PC %s squashed.\n",
                     tid, squashed_inst->seqNum, squashed_inst->pcState());
@@ -1389,6 +1496,13 @@ InstructionQueue<Impl>::addToDependents(const DynInstPtr &new_inst)
                         src_reg->className());
                 // Mark a register ready within the instruction.
                 new_inst->markSrcRegReady(src_reg_idx);
+
+                if (GCONFIGS.hw == utils::STT) {
+                    auto parent_inst = dependGraph.getInst(src_reg->flatIndex());
+                    if (parent_inst && parent_inst->isDestTainted()) {
+                        new_inst->setYRoT(parent_inst);
+                    }
+                }
             }
         }
     }
@@ -1436,6 +1550,8 @@ template <class Impl>
 void
 InstructionQueue<Impl>::addIfReady(const DynInstPtr &inst)
 {
+    if (inst->isEagerIssued()) return;
+
     // If the instruction now has all of its source registers
     // available, then add it to the list of ready instructions.
     if (inst->readyToIssue()) {
@@ -1449,6 +1565,16 @@ InstructionQueue<Impl>::addIfReady(const DynInstPtr &inst)
             // its registers ready.
             memDepUnit[inst->threadNumber].regsReady(inst);
 
+            return;
+        }
+
+        if ((GCONFIGS.hw == utils::FENCE || GCONFIGS.hw == utils::STT) &&
+            inst->isTransmitter() &&
+            inst->isSpeculative() &&
+            !inst->isReachedESP() &&
+            !inst->isMemRef() &&
+            !inst->isSquashed()) {
+            fenceGenericInst(inst);
             return;
         }
 

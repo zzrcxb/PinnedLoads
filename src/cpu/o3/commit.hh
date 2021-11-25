@@ -50,6 +50,11 @@
 #include "enums/CommitPolicy.hh"
 #include "sim/probe/probe.hh"
 
+#include "cpu/global_utils.hh"
+#include "cpu/o3/perf_counter.hh"
+
+extern PerfCounter PERF_CNT;
+
 struct DerivO3CPUParams;
 
 template <class>
@@ -133,8 +138,17 @@ class DefaultCommit
     /** To probe when an instruction is squashed */
     ProbePointArg<DynInstPtr> *ppSquash;
 
+    size_t _print_interval_inst = 100000;
+    uint64_t _print_interval_tick = 100000000, _init_tick = 0;
+    bool _print_inst = false, _print_tick = false, _perf_dumped = false;
+
     /** Mark the thread as processing a trap. */
     void processTrapEvent(ThreadID tid);
+
+    /** Dump performance counter results. */
+    void dumpPerfCounter();
+
+    Tick _last_retirement[Impl::MaxThreads];
 
   public:
     /** Construct a DefaultCommit with the given parameters. */

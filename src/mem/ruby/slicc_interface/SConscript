@@ -36,3 +36,7 @@ SimObject('Controller.py')
 Source('AbstractController.cc')
 Source('AbstractCacheEntry.cc')
 Source('RubyRequest.cc')
+
+DebugFlag('RubyTracer')
+DebugFlag('NSR')
+DebugFlag('DEV')

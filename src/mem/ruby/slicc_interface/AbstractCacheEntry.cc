@@ -96,6 +96,21 @@ AbstractCacheEntry::isLocked(int context) const
     return m_locked == context;
 }
 
+bool
+AbstractCacheEntry::isUnSquashable() const {
+    return m_unSquashable;
+}
+
+void
+AbstractCacheEntry::setUnSquashable() {
+    m_unSquashable = true;
+}
+
+void
+AbstractCacheEntry::clearUnSquashable() {
+    m_unSquashable = false;
+}
+
 void
 AbstractCacheEntry::setInHtmReadSet(bool val)
 {

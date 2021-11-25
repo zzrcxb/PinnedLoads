@@ -47,6 +47,10 @@ struct MachineID
 
     MachineType getType() const { return type; }
     NodeID getNum() const { return num; }
+
+    std::string toString() const {
+        return csprintf("%s_%d", MachineType_to_string(type), num);
+    }
 };
 
 inline std::string

@@ -174,6 +174,12 @@ class MessageBuffer : public SimObject
         return functionalAccess(pkt, true) == 1;
     }
 
+    void moveToReplay(Addr addr, Tick current_time);
+
+    void recycleReplayMsg(Addr addr, Tick current_time, Tick recycle_latency);
+
+    void dropReplay(Addr addr, Tick current_time);
+
   private:
     void reanalyzeList(std::list<MsgPtr> &, Tick);
 
@@ -213,6 +219,9 @@ class MessageBuffer : public SimObject
      */
     typedef std::unordered_map<Addr, std::vector<MsgPtr>> DeferredMsgMapType;
     DeferredMsgMapType m_deferred_msg_map;
+
+    typedef std::unordered_map<Addr, std::vector<MsgPtr>> ReplayMsgMapType;
+    ReplayMsgMapType m_replay_msg_map;
 
     /**
      * Current size of the stall map.

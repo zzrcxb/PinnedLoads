@@ -237,8 +237,8 @@ RubyPort::PioResponsePort::recvAtomic(PacketPtr pkt)
 bool
 RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
 {
-    DPRINTF(RubyPort, "Timing request for address %#x on port %d\n",
-            pkt->getAddr(), id);
+    DPRINTF(RubyPort, "Timing request for address %#x on port %d with cmd %s\n",
+            pkt->getAddr(), id, pkt->cmdString());
     RubyPort *ruby_port = static_cast<RubyPort *>(&owner);
 
     if (pkt->cacheResponding())
@@ -253,6 +253,15 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
         schedTimingResp(pkt, curTick());
         return true;
     }
+
+    if (!ruby_port->system->isMemAddr(pkt->getAddr()) &&
+        (pkt->isSetUnSquashable() || pkt->isClearUnSquashable())) {
+        DPRINTF(RubyPort, "NSR Lock/Unlock request to non-mem address %#x, ignored\n",
+                pkt->getAddr());
+        pkt->setNotMemAddr();
+        return false;
+    }
+
     // Check for pio requests and directly send them to the dedicated
     // pio port.
     if (pkt->cmd != MemCmd::MemSyncReq) {
@@ -281,18 +290,32 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
     // Submit the ruby request
     RequestStatus requestStatus = ruby_port->makeRequest(pkt);
 
+    if ((pkt->isSetUnSquashable() || pkt->isClearUnSquashable()) &&
+        requestStatus == RequestStatus_Aliased) {
+        DPRINTF(RubyTracer, "Failed to lock %p since the line is no longer there\n",
+                pkt->getAddr());
+    }
+
     // If the request successfully issued then we should return true.
     // Otherwise, we need to tell the port to retry at a later point
     // and return false.
     if (requestStatus == RequestStatus_Issued) {
         DPRINTF(RubyPort, "Request %s 0x%x issued\n", pkt->cmdString(),
                 pkt->getAddr());
+        if (pkt->isSetUnSquashable() || pkt->isClearUnSquashable()) {
+            SenderState *ss = safe_cast<SenderState *>(pkt->popSenderState());
+            delete ss;
+        }
         return true;
     }
 
     // pop off sender state as this request failed to issue
     SenderState *ss = safe_cast<SenderState *>(pkt->popSenderState());
     delete ss;
+
+    if (pkt->isSetUnSquashable() || pkt->isClearUnSquashable()) {
+        return false;
+    }
 
     if (pkt->cmd != MemCmd::MemSyncReq) {
         DPRINTF(RubyPort,
@@ -624,6 +647,26 @@ RubyPort::ruby_eviction_callback(Addr address)
     // Use a single packet to signal all snooping ports of the invalidation.
     // This assumes that snooping ports do NOT modify the packet/request
     Packet pkt(request, MemCmd::InvalidateReq);
+    for (CpuPortIter p = response_ports.begin(); p != response_ports.end();
+         ++p) {
+        // check if the connected request port is snooping
+        if ((*p)->isSnooping()) {
+            // send as a snoop request
+            (*p)->sendTimingSnoopReq(&pkt);
+        }
+    }
+}
+
+void
+RubyPort::ruby_updateCLT(Addr addr, bool insert, bool external) {
+    auto request = std::make_shared<Request>(
+        addr, RubySystem::getBlockSizeBytes(), 0,
+        Request::funcRequestorId);
+    Packet pkt(request, insert ? MemCmd::InsertCLTReq : MemCmd::EraseCLTReq);
+    if (external) {
+        pkt.setExternalUpdate();
+    }
+
     for (CpuPortIter p = response_ports.begin(); p != response_ports.end();
          ++p) {
         // check if the connected request port is snooping

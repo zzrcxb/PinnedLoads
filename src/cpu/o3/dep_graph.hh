@@ -97,6 +97,10 @@ class DependencyGraph
     void clearInst(PhysRegIndex idx)
     { dependGraph[idx].inst = NULL; }
 
+    DynInstPtr getInst(PhysRegIndex idx) {
+        return dependGraph[idx].inst;
+    }
+
     /** Removes an instruction from a single linked list. */
     void remove(PhysRegIndex idx, const DynInstPtr &inst_to_remove);
 

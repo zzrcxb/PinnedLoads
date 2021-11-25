@@ -47,6 +47,8 @@
 #include <map>
 #include <memory>
 #include <queue>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "arch/generic/debugfaults.hh"
 #include "arch/generic/vec_reg.hh"
@@ -56,8 +58,13 @@
 #include "cpu/timebuf.hh"
 #include "debug/HtmCpu.hh"
 #include "debug/LSQUnit.hh"
+#include "debug/RubyTracer.hh"
+#include "debug/MemDbg.hh"
+#include "debug/NSR.hh"
 #include "mem/packet.hh"
 #include "mem/port.hh"
+#include "mem/ruby/common/Address.hh"
+#include "cpu/global_utils.hh"
 
 struct DerivO3CPUParams;
 #include "base/circular_queue.hh"
@@ -116,6 +123,8 @@ class LSQUnit
             }
         }
 
+        std::string name() { return ".LSQEntry"; }
+
         void
         clear()
         {
@@ -146,6 +155,9 @@ class LSQUnit
         const uint32_t& size() const { return _size; }
         const DynInstPtr& instruction() const { return inst; }
         /** @} */
+
+        bool isUnSquashable() const { return inst->isUnSquashable(); }
+        void setUnSquashable() { inst->setUnSquashable(); }
     };
 
     class SQEntry : public LSQEntry
@@ -164,6 +176,8 @@ class LSQUnit
          * style instructs (ARM DC ZVA; ALPHA WH64)
          */
         bool _isAllZeros;
+
+        bool _dataAvail = true;
       public:
         static constexpr size_t DataSize = sizeof(_data);
         /** Constructs an empty store queue entry. */
@@ -202,6 +216,9 @@ class LSQUnit
         const bool& isAllZeros() const { return _isAllZeros; }
         char* data() { return _data; }
         const char* data() const { return _data; }
+        bool dataAvail() const { return _dataAvail; }
+        void setDataAvail() { _dataAvail = true; }
+        void resetDataAvail() { _dataAvail = false; }
         /** @} */
     };
     using LQEntry = LSQEntry;
@@ -487,6 +504,92 @@ class LSQUnit
      */
     bool recvTimingResp(PacketPtr pkt);
 
+    void reIssueDelayedReqs();
+    bool markUnSquashables();
+    void issueEagerTranslated();
+    void updateCLT(PacketPtr pkt);
+
+  private:
+    bool checkCLT(Addr addr) const {
+        if (!CLTOverflowed) {
+            return IN_SET(addr, unlockableLines);
+        } else {
+            return true;
+        }
+    }
+
+    bool unlockBufferRetry();
+    bool tryLockLQEntry(uint32_t idx, bool isPreLock=false);
+    bool tryUnlockLQEntry(uint32_t idx, bool addToRetry=false);
+    bool trySendNSR(Addr address, bool lock, bool &notMemAddr,
+                    bool isPreLock=false);
+
+    uint32_t addressToL1DCacheSet(Addr address) const {
+        uint high = L1StartIndexBit + L1DNumSetBit - 1;
+        if (L1DNumSetBit == 0) {
+            return 0;
+        } else {
+            return (uint32_t)bitSelect(address, L1StartIndexBit, high);
+        }
+    }
+
+    uint32_t addressToL2CacheSet(Addr address) const {
+        uint high = L2StartIndexBit + L2NumSetBit - 1;
+        if (L2NumSetBit == 0) {
+            return 0;
+        } else {
+            return (uint32_t)bitSelect(address, L2StartIndexBit, high);
+        }
+    }
+
+    uint32_t addressToSlice(Addr address) const {
+        uint high = L2StartIndexBit + numL2Bit - 1;
+        if (numL2Bit == 0) {
+            return 0;
+        } else {
+            return (uint32_t)bitSelect(address, L2StartIndexBit, high);
+        }
+    }
+
+    uint32_t addressToLLCHaswell(Addr addr) const {
+        static std::unordered_map<Addr, uint> _map_cache;
+        if (_map_cache.find(addr) != _map_cache.end()) {
+            return _map_cache.at(addr);
+        }
+
+        uint sid = 0;
+        std::vector<uint> hash0 = {17, 18, 20, 22, 24, 25, 26, 27, 28, 30, 32};
+        std::vector<uint> hash1 = {19, 22, 23, 26, 27, 30, 31};
+        std::vector<uint> hash2 = {17, 20, 21, 24, 27, 28, 29, 30};
+
+        uint tmp;
+
+        tmp = 0;
+        for (auto i : hash2)
+            tmp ^= ((addr >> i) & 1);
+        sid |= ((tmp & 1) << 2);
+
+        tmp = 0;
+        for (auto i : hash1)
+            tmp ^= ((addr >> i) & 1);
+        sid |= ((tmp & 1) << 1);
+
+        tmp = 0;
+        for (auto i : hash0)
+            tmp ^= ((addr >> i) & 1);
+        sid |= (tmp & 1);
+
+        sid %= bridge::GCONFIGS.numL2;
+
+        return sid;
+    }
+
+    uint64_t getL1DConflictID(Addr address, bool hash) const;
+    uint64_t getL2ConflictID(Addr address, bool hash) const;
+    bool checkEntryConflicts(uint32_t idx);
+    bool checkConflicts(Addr line, InstSeqNum seqNum);
+    void removeEntryConflicts(uint32_t idx);
+
   private:
     /** The LSQUnit thread id. */
     ThreadID lsqID;
@@ -496,6 +599,9 @@ class LSQUnit
 
     /** The load queue. */
     LoadQueue loadQueue;
+
+    /** The buffer to store delayed requests in DOM */
+    std::unordered_set<LSQRequest*> delayedReqs;
 
   private:
     /** The number of places to shift addresses in the LSQ before checking
@@ -525,6 +631,136 @@ class LSQUnit
      */
     typename StoreQueue::iterator storeWBIt;
 
+
+    // NSR
+    typedef enum {
+        STRICT,
+        PARTITIONED
+    } NSRPolicy;
+    NSRPolicy nsrPolicy;
+
+    typedef uint64_t ConflictID;
+
+    struct CSTRecord {
+        Addr line;
+        uint64_t seqNum;
+    };
+
+    struct CacheShadowTable {
+        size_t entry_num, record_num;
+        Addr cacheBlockMask;
+
+        CacheShadowTable(size_t entry_num, size_t record_num, Addr cacheBlockMask) :
+                         entry_num(entry_num),
+                         record_num(record_num),
+                         cacheBlockMask(cacheBlockMask) {}
+
+        uint64_t get_record_id(Addr line) {
+            uint64_t rid;
+            size_t recordHashBit = bridge::GCONFIGS.CSTRecordSize;
+            if (bridge::GCONFIGS.compressCST) {
+                rid = line >> 6;
+
+                uint64_t tmp = rid;
+                uint iter = 42 / recordHashBit;
+                for (uint i = 1; i < iter; i++) {
+                    tmp ^= (rid >> (i * recordHashBit));
+                }
+                rid = tmp % (1 << recordHashBit);
+            } else {
+                rid = line;
+            }
+            return rid;
+        }
+
+        // has resources for a new entry?
+        bool check_and_insert(Addr line, ConflictID id, ConflictID _realID, uint64_t seqNum,
+                              bool &overflow, bool &tagMismatch, bool &hashCol) {
+            assert(line == (line & cacheBlockMask));
+
+            auto rid = get_record_id(line);
+            if (IN_MAP(id, _cst)) {
+                assert(IN_MAP(id, _rev_hash));
+                if (_rev_hash.at(id) != _realID) {
+                    hashCol = true;
+                }
+
+                if (IN_MAP(rid, _cst.at(id))) {
+                    // check for hash collision
+                    if (_cst.at(id).at(rid).line != line) {
+                        // tag mismatch
+                        tagMismatch = true;
+                        return false;
+                    } else {
+                        // already accessed by an older load
+                        if (seqNum > _cst.at(id).at(rid).seqNum) {
+                            _cst.at(id).at(rid).seqNum = seqNum;
+                        }
+                        return true;
+                    }
+                } else {
+                    // check whether it has room
+                    if (_cst.at(id).size() < record_num) {
+                        _cst.at(id)[rid] = (CSTRecord){line, seqNum};
+                        return true;
+                    } else {
+                        return false;
+                    }
+                }
+            } else {
+                // no entry is found, first request to the set
+                if (_cst.size() < entry_num) {
+                    _cst[id][rid] = (CSTRecord){line, seqNum};
+                    _rev_hash[id] = _realID;
+                    return true;
+                } else {
+                    overflow = true;
+                    return false;
+                }
+            }
+        }
+
+        // remove a line from CST
+        void commit_or_squash(Addr line, ConflictID id, uint64_t seqNum) {
+            assert(line == (line & cacheBlockMask));
+
+            auto rid = get_record_id(line);
+            if (IN_MAP(id, _cst) && IN_MAP(rid, _cst.at(id)) &&
+                _cst.at(id).at(rid).seqNum == seqNum &&
+                _cst.at(id).at(rid).line == line) {
+                // it is the youngest load that locked the line
+                _cst.at(id).erase(rid);
+                if (_cst.at(id).empty()) {
+                    _cst.erase(id);
+                    _rev_hash.erase(id);
+                }
+            }
+        }
+
+        size_t get_entry_num() const {
+            return _cst.size();
+        }
+
+      private:
+        std::unordered_map<ConflictID, std::unordered_map<Addr, CSTRecord>> _cst;
+        std::unordered_map<ConflictID, ConflictID> _rev_hash;
+    };
+
+    std::unordered_map<Addr, typename LoadQueue::iterator> YNLC_map;
+    std::unordered_set<Addr> unlockableLines; // CLT
+    std::unordered_set<Addr> NSRUnlockBuffer;
+
+    bool CSTBlocked = false;
+    uint L1StartIndexBit, L1DNumSetBit, L2StartIndexBit, L2NumSetBit, numL2Bit;
+    uint L1DConflictSize, L2ConflictSize;
+    bool CLTOverflowed = false;
+
+    std::shared_ptr<CacheShadowTable> L1DCST, L2CST;
+
+    typedef std::list<DynInstPtr> WaitingList;
+    typedef std::shared_ptr<WaitingList> WaitingList_p;
+    std::unordered_map<int16_t, WaitingList_p> eagerTransBuffer;
+
     /** Address Mask for a cache block (e.g. ~(cache_block_size-1)) */
     Addr cacheBlockMask;
 
@@ -543,7 +779,7 @@ class LSQUnit
     /** The packet that needs to be retried. */
     PacketPtr retryPkt;
 
-    /** Whehter or not a store is blocked due to the memory system. */
+    /** Whether or not a store is blocked due to the memory system. */
     bool isStoreBlocked;
 
     /** Whether or not a store is in flight. */
@@ -590,6 +826,65 @@ class LSQUnit
 
         /** Number of times the LSQ is blocked due to the cache. */
         Stats::Scalar blockedByCache;
+
+        /** Number of un-squashable LQ entries */
+        Stats::Scalar unSquashables;
+
+        /** Number of pre-locked LQ entries */
+        Stats::Scalar preLocks;
+
+        /** Number of NSR conflicts */
+        Stats::Scalar NSRConflictChecks;
+        Stats::Scalar NSRConflicts;
+        Stats::Scalar NSRL1Conflicts;
+        Stats::Scalar NSRLLCConflicts;
+
+        /** Number of locking requests */
+        Stats::Scalar NSRLockingReq;
+
+        /** Number of unlocking requests */
+        Stats::Scalar NSRUnlockingReq;
+
+        /** Number of locked lines that are incorrectly squashed, should be 0 */
+        Stats::Scalar squashedLocked;
+
+        /** Number of eagerly translated stores */
+        Stats::Scalar eagerTranslated;
+
+        /** Number of delayed load forward */
+        Stats::Scalar delayedFwd;
+
+        /** Number of locked LQ entries */
+        Stats::Distribution lockedLQEntryNum;
+
+        /** Number of L1D CST overflow */
+        Stats::Scalar L1DCSTOverflow;
+        Stats::Scalar L1DCSTTagMiss;
+        Stats::Scalar L1DCSTHashCollision;
+        Stats::Scalar L1DCSTTagMissConf;
+        Stats::Scalar L1DCSTHashColConf;
+        Stats::Distribution L1DCSTEntries;
+
+        /** Number of L2 CST overflow */
+        Stats::Scalar L2CSTOverflow;
+        Stats::Scalar L2CSTTagMiss;
+        Stats::Scalar L2CSTHashCollision;
+        Stats::Scalar L2CSTTagMissConf;
+        Stats::Scalar L2CSTHashColConf;
+        Stats::Distribution L2CSTEntries;
+
+        /** Number of CLT overflow */
+        Stats::Scalar CLTOverflow;
+        Stats::Distribution CLTEntries;
+
+        /** Stats for reason of cannot be locked */
+        Stats::Scalar NSRUnlockVP;
+        Stats::Scalar NSRUnlockException;
+        Stats::Scalar NSRUnlockAddr;
+        Stats::Scalar NSRUnlockDataRecv;
+        Stats::Scalar NSRUnlockConflicts;
+        Stats::Scalar NSRUnlockRMW;
+        Stats::Scalar NSRUnlockSB;
     } stats;
 
   public:
@@ -598,6 +893,8 @@ class LSQUnit
 
     /** Executes the store at the given index. */
     Fault write(LSQRequest *req, uint8_t *data, int store_idx);
+
+    Fault setMemData(const DynInstPtr& inst, uint8_t *data);
 
     /** Returns the index of the head load instruction. */
     int getLoadHead() { return loadQueue.head(); }
@@ -647,6 +944,8 @@ LSQUnit<Impl>::read(LSQRequest *req, int load_idx)
     // A bit of a hackish way to get strictly ordered accesses to work
     // only if they're at the head of the LSQ and are ready to commit
     // (at the head of the ROB too).
+
+    DSTATE(Read, load_inst);
 
     if (req->mainRequest()->isStrictlyOrdered() &&
         (load_idx != loadQueue.head() || !load_inst->isAtCommit())) {
@@ -795,9 +1094,30 @@ LSQUnit<Impl>::read(LSQRequest *req, int load_idx)
                   (store_has_upper_limit || lower_load_has_store_part)))) {
 
                 coverage = AddrRangeCoverage::PartialAddrRangeCoverage;
+                auto &store_inst = store_it->instruction();
+                CSPRINT(Partial, load_inst, "Store: %#x@%llu; addr: %#x\n",
+                        store_inst->instAddr(), store_inst->seqNum,
+                        store_inst->effAddr);
+            }
+
+            if (coverage == AddrRangeCoverage::FullAddrRangeCoverage &&
+                !store_it->dataAvail()) {
+
+                assert(IN_MAP(store_it.idx(), eagerTransBuffer));
+                eagerTransBuffer[store_it.idx()]->push_back(load_inst);
+                stats.delayedFwd += 1;
+
+                CSPRINT(StoreNotReady, load_inst, "delayed by: %#x+%llu@%llu\n",
+                        store_it->instruction()->instAddr(),
+                        store_it->instruction()->microPC(),
+                        store_it->instruction()->seqNum);
+
+                return NoFault;
             }
 
             if (coverage == AddrRangeCoverage::FullAddrRangeCoverage) {
+                DSTATE(FullConverage, load_inst);
+
                 // Get shift amount for offset into the store's data.
                 int shift_amt = req->mainRequest()->getVaddr() -
                     store_it->instruction()->effAddr;
@@ -874,6 +1194,7 @@ LSQUnit<Impl>::read(LSQRequest *req, int load_idx)
 
                 return NoFault;
             } else if (coverage == AddrRangeCoverage::PartialAddrRangeCoverage) {
+                DSTATE(PartialConverage, load_inst);
                 // If it's already been written back, then don't worry about
                 // stalling on it.
                 if (store_it->completed()) {
@@ -916,6 +1237,8 @@ LSQUnit<Impl>::read(LSQRequest *req, int load_idx)
     // If there's no forwarding case, then go access memory
     DPRINTF(LSQUnit, "Doing memory access for inst [sn:%lli] PC %s\n",
             load_inst->seqNum, load_inst->pcState());
+
+    DSTATE(MemAccess, load_inst);
 
     // Allocate memory if this is the first time a load is issued.
     if (!load_inst->memData) {
@@ -968,6 +1291,23 @@ LSQUnit<Impl>::write(LSQRequest *req, uint8_t *data, int store_idx)
     storeQueue[store_idx].setRequest(req);
     unsigned size = req->_size;
     storeQueue[store_idx].size() = size;
+
+    if (req->isEagerTranslated()) {
+        if (!(req->request()->getFlags() & Request::CACHE_BLOCK_ZERO) &&
+            !req->request()->isCacheMaintenance() &&
+            !req->request()->isAtomic()) {
+                storeQueue[store_idx].resetDataAvail();
+                WaitingList_p wl(new WaitingList);
+                eagerTransBuffer[store_idx] = wl;
+                stats.eagerTranslated += 1;
+                return NoFault;
+        } else {
+            assert(false);
+        }
+    } else {
+        storeQueue[store_idx].setDataAvail();
+    }
+
     bool store_no_data =
         req->mainRequest()->getFlags() & Request::STORE_NO_DATA;
     storeQueue[store_idx].isAllZeros() = store_no_data;

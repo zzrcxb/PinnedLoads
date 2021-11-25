@@ -88,6 +88,26 @@ class AbstractCacheEntry : public ReplaceableEntry
     void clearLocked();
     bool isLocked(int context) const;
 
+    bool isUnSquashable() const;
+    void setUnSquashable();
+    void clearUnSquashable();
+
+    void addSharers(int cnt) {
+        m_sharers += cnt;
+    }
+
+    void removeSharers(int cnt) {
+        if (cnt > m_sharers) {
+            resetSharers();
+        } else {
+            m_sharers -= cnt;
+        }
+    }
+
+    void resetSharers() {
+        m_sharers = 0;
+    }
+
     // Address of this block, required by CacheMemory
     Addr m_Address;
     // Holds info whether the address is locked.
@@ -114,6 +134,8 @@ class AbstractCacheEntry : public ReplaceableEntry
     // hardware transactional memory
     bool m_htmInReadSet;
     bool m_htmInWriteSet;
+    bool m_unSquashable = false;
+    uint m_sharers = 0;
 };
 
 inline std::ostream&

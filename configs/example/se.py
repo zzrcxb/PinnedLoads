@@ -46,6 +46,7 @@ from __future__ import absolute_import
 import optparse
 import sys
 import os
+import benchmarks
 
 import m5
 from m5.defines import buildEnv
@@ -121,6 +122,7 @@ def get_processes(options):
 parser = optparse.OptionParser()
 Options.addCommonOptions(parser)
 Options.addSEOptions(parser)
+Options.addCustomOptions(parser)
 
 if '--ruby' in sys.argv:
     Ruby.define_options(parser)
@@ -156,10 +158,23 @@ if options.bench:
             sys.exit(1)
 elif options.cmd:
     multiprocesses, numThreads = get_processes(options)
+elif options.benchmark:
+    process = getattr(benchmarks, options.benchmark, None)
+    if not process:
+        print("Unknown workload specified. Exiting!\n", file=sys.stderr)
+        sys.exit(1)
+    else:
+        multiprocesses.append(process)
+        numThreads = 1
 else:
     print("No workload specified. Exiting!\n", file=sys.stderr)
     sys.exit(1)
 
+for process in multiprocesses:
+    if options.bench_stdout:
+        process.output = options.bench_stdout
+    if options.bench_stderr:
+        process.errout = options.bench_stderr
 
 (CPUClass, test_mem_mode, FutureClass) = Simulation.setCPUClass(options)
 CPUClass.numThreads = numThreads

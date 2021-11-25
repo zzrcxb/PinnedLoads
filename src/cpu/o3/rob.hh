@@ -44,11 +44,16 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_set>
 
 #include "arch/registers.hh"
 #include "base/types.hh"
 #include "config/the_isa.hh"
 #include "enums/SMTQueuePolicy.hh"
+
+#include "cpu/global_utils.hh"
+#include "cpu/colors.hh"
+#include "debug/Tracer.hh"
 
 struct DerivO3CPUParams;
 
@@ -66,6 +71,8 @@ class ROB
     typedef std::pair<RegIndex, PhysRegIndex> UnmapInfo;
     typedef typename std::list<DynInstPtr>::iterator InstIt;
 
+    typedef std::list<DynInstPtr> DynInstList;
+
     /** Possible ROB statuses. */
     enum Status {
         Running,
@@ -73,12 +80,35 @@ class ROB
         ROBSquashing
     };
 
+    struct SpecStatus {
+        // a set of *unresolved* (i.e., not reach OSP) squashing instructions
+        DynInstList squashingInsts;
+        size_t loadCnt, callCnt, FPConvCnt, exceptCnt, addrNotValid;
+
+        SpecStatus() : loadCnt(0), callCnt(0), FPConvCnt(0), exceptCnt(0),
+                       addrNotValid(0) {}
+
+        void reset() {
+            squashingInsts.clear();
+            loadCnt = 0;
+            callCnt = 0;
+            FPConvCnt = 0;
+            exceptCnt = 0;
+            addrNotValid = 0;
+        }
+    };
+
   private:
     /** Per-thread ROB status. */
     Status robStatus[Impl::MaxThreads];
 
+    /** Per-thread ROB speculation status */
+    SpecStatus robSpecStatus[Impl::MaxThreads];
+
     /** ROB resource sharing policy for SMT mode. */
     SMTQueuePolicy robPolicy;
+
+    bool pendingSquashes[Impl::MaxThreads];
 
   public:
     /** ROB constructor.
@@ -203,6 +233,11 @@ class ROB
     /** Updates the tail instruction with the new youngest instruction. */
     void updateTail();
 
+    void updateSpecStatus();
+    void updateInstStatus(DynInstPtr inst, ThreadID tid, bool updateROB=true);
+    void updateROBSpecStatus(DynInstPtr inst, ThreadID tid);
+    void resetROBSpecStatus(ThreadID tid);
+
     /** Reads the PC of the oldest head instruction. */
 //    uint64_t readHeadPC();
 
@@ -256,6 +291,18 @@ class ROB
      *  double checking that variable.
      */
     size_t countInsts(ThreadID tid);
+
+    bool hasPendingSquash(ThreadID tid) const {
+        return pendingSquashes[tid];
+    }
+
+    void setPendingSquash(ThreadID tid) {
+        pendingSquashes[tid] = true;
+    }
+
+    void clearPendingSquash(ThreadID tid) {
+        pendingSquashes[tid] = false;
+    }
 
   private:
     /** Reset the ROB state */
@@ -328,6 +375,8 @@ class ROB
         Stats::Scalar reads;
         // The number of rob_writes
         Stats::Scalar writes;
+        // The number of transmitters that are become SI earlier due to SS
+        Stats::Scalar SIDueToSS;
     } stats;
 };
 

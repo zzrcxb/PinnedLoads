@@ -124,7 +124,7 @@ class DerivO3CPU(BaseCPU):
     backComSize = Param.Unsigned(5, "Time buffer size for backwards communication")
     forwardComSize = Param.Unsigned(5, "Time buffer size for forward communication")
 
-    LQEntries = Param.Unsigned(32, "Number of load queue entries")
+    LQEntries = Param.Unsigned(62, "Number of load queue entries")
     SQEntries = Param.Unsigned(32, "Number of store queue entries")
     LSQDepCheckShift = Param.Unsigned(4, "Number of places to shift addr before check")
     LSQCheckLoads = Param.Bool(True,
@@ -171,11 +171,54 @@ class DerivO3CPU(BaseCPU):
     smtROBThreshold = Param.Int(100, "SMT ROB Threshold Sharing Parameter")
     smtCommitPolicy = Param.CommitPolicy('RoundRobin', "SMT Commit Policy")
 
-    branchPred = Param.BranchPredictor(TournamentBP(numThreads =
-                                                       Parent.numThreads),
-                                       "Branch Predictor")
+    branchPred = Param.BranchPredictor(LTAGE(), "Branch Predictor")
     needsTSO = Param.Bool(buildEnv['TARGET_ISA'] == 'x86',
                           "Enable TSO Memory model")
+
+    # Extra options for DOM, SXS
+    # general scheme related settings
+    HWName          = Param.String("Unsafe", "Scheme of the processor")
+    threatModelName = Param.String("Unsafe", "Scheme of the processor")
+    ISAName         = Param.String(buildEnv['TARGET_ISA'], "ISA")
+
+    delayInvAck     = Param.Bool(False, "Delay invalidation ack")
+    delayWB         = Param.Bool(False, "Delay writeback until OSP")
+
+    # stats
+    saveSimStat   = Param.Bool(False, "Dump ROB status")
+    simStatPath   = Param.String("", "Path to save simulation statistics")
+    outputDir     = Param.String("", "Path to output dir")
+    maxInsts      = Param.UInt64(0, "Max number of instructions")
+    maxTicks      = Param.UInt64(0, "Max relative tick number")
+
+    # debug
+    dumpROB     = Param.Bool(False, "Dump ROB status")
+    ROBDumpPath = Param.String("", "Path to ROB dump")
+
+    # NSR related; assumes MESI_Two_Level
+    L1DSize  = Param.Int(64 * 1024, "L1D Size")
+    L1DAssoc = Param.Int(2, "L1D assoc")
+    L2Size   = Param.Int(2 * 1024 * 1024, "L2 Size")
+    L2Assoc  = Param.Int(8, "L1D assoc")
+    numL2    = Param.Int(1, "# of L2 caches")
+    L2VPartition     = Param.Int(1, "# of L2 virtual partition")
+    eagerTranslation = Param.Bool(False, "Eagerly translate store addresses")
+    cachelineSize    = Param.Int(64, "cacheline size")
+
+    # CST related
+    L1DCSTEntryCnt = Param.Int(8, "L1D CST Entry Count")
+    L1DCSTRecordCnt = Param.Int(2, "L1D CST Record Count")
+    L2CSTEntryCnt = Param.Int(8, "L2 CST Entry Count")
+    L2CSTRecordCnt = Param.Int(2, "L2 CST Record Count")
+    entryUseCAM = Param.Bool(False, "Use CAM to index entry")
+    CSTRecord = Param.Int(42, "CST record address field size")
+
+    CLTSize = Param.Int(4, "CLT Size")
+
+    lowerSeqNum   = Param.Int(0, "lower bound for DSTATE")
+    upperSeqNum   = Param.Int(0, "upper bound for DSTATE")
+    collectPerfStats = Param.Bool(False, "Use perf counter to collect per static insn stats")
+    specBreakdown = Param.String("", "breakdown of speculation types")
 
     def addCheckerCpu(self):
         if buildEnv['TARGET_ISA'] in ['arm']:

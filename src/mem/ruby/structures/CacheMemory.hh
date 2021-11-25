@@ -82,10 +82,23 @@ class CacheMemory : public SimObject
     // tests to see if an address is present in the cache
     bool isTagPresent(Addr address) const;
 
+    std::pair<uint, uint> getPartitionRange(NodeID nid) const {
+        if (m_partitioned) {
+            assert(nid < m_num_partition);
+            uint p_start = nid * m_partition_size;
+            return std::make_pair(p_start, p_start + m_partition_size - 1);
+        } else {
+            return std::make_pair(0, m_cache_assoc - 1);
+        }
+    }
+
     // Returns true if there is:
     //   a) a tag match on this address or there is
     //   b) an unused line in the same cache "way"
     bool cacheAvail(Addr address) const;
+    bool cacheAvail(Addr address, NodeID nid) const;
+
+    bool isUnSquashable(Addr address) const;
 
     // Returns a NULL entry that acts as a placeholder for invalid lines
     AbstractCacheEntry*
@@ -96,6 +109,7 @@ class CacheMemory : public SimObject
 
     // find an unused entry and sets the tag appropriate for the address
     AbstractCacheEntry* allocate(Addr address, AbstractCacheEntry* new_entry);
+    AbstractCacheEntry* allocate(Addr address, AbstractCacheEntry* new_entry, NodeID nid);
     void allocateVoid(Addr address, AbstractCacheEntry* new_entry)
     {
         allocate(address, new_entry);
@@ -106,6 +120,7 @@ class CacheMemory : public SimObject
 
     // Returns with the physical address of the conflicting cache line
     Addr cacheProbe(Addr address) const;
+    Addr cacheProbe(Addr address, NodeID nid) const; // if the cache is partitioned
 
     // looks an address up in the cache
     AbstractCacheEntry* lookup(Addr address);
@@ -216,6 +231,9 @@ class CacheMemory : public SimObject
     int m_start_index_bit;
     bool m_resource_stalls;
     int m_block_size;
+    bool m_partitioned;
+    uint m_num_partition;
+    uint m_partition_size;
 
     /**
      * We store all the ReplacementData in a 2-dimensional array. By doing

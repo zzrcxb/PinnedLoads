@@ -57,6 +57,7 @@
 #include "params/DerivO3CPU.hh"
 
 using namespace std;
+using bridge::GCONFIGS;
 
 template <class Impl>
 LSQ<Impl>::LSQ(O3CPU *cpu_ptr, IEW *iew_ptr, DerivO3CPUParams *params)
@@ -321,7 +322,11 @@ LSQ<Impl>::recvTimingResp(PacketPtr pkt)
     auto senderState = dynamic_cast<LSQSenderState*>(pkt->senderState);
     panic_if(!senderState, "Got packet back with unknown sender state\n");
 
-    thread[cpu->contextToThread(senderState->contextId())].recvTimingResp(pkt);
+    if (!thread[cpu->contextToThread(senderState->contextId())].recvTimingResp(pkt)) {
+        cpu->wakeCPU();
+        cpu->activityThisCycle();
+        return true;
+    }
 
     if (pkt->isInvalidate()) {
         // This response also contains an invalidate; e.g. this can be the case
@@ -361,6 +366,10 @@ LSQ<Impl>::recvTimingSnoopReq(PacketPtr pkt)
                 pkt->getAddr());
         for (ThreadID tid = 0; tid < numThreads; tid++) {
             thread[tid].checkSnoop(pkt);
+        }
+    } else if (pkt->isUpdateCLT()) {
+        for (ThreadID tid = 0; tid < numThreads; tid++) {
+            thread[tid].updateCLT(pkt);
         }
     }
 }
@@ -708,13 +717,22 @@ LSQ<Impl>::pushRequest(const DynInstPtr& inst, bool isLoad, uint8_t *data,
             assert(size == 8);
             req = new HtmCmdRequest(&thread[tid], inst, flags);
         } else if (needs_burst) {
+            CSPRINT(SplitDataRequest, inst, "addr: %#x\n", addr);
             req = new SplitDataRequest(&thread[tid], inst, isLoad, addr,
                     size, flags, data, res);
         } else {
+            CSPRINT(SingleDataRequest, inst, "addr: %#x\n", addr);
             req = new SingleDataRequest(&thread[tid], inst, isLoad, addr,
                     size, flags, data, res, std::move(amo_op));
         }
         assert(req);
+
+        if (GCONFIGS.hw == utils::DOM &&
+            inst->isSpeculative() &&
+            !inst->isReachedESP() && isLoad) {
+            req->setSpeculative();
+        }
+
         if (!byte_enable.empty()) {
             req->_byteEnable = byte_enable;
         }
@@ -728,8 +746,16 @@ LSQ<Impl>::pushRequest(const DynInstPtr& inst, bool isLoad, uint8_t *data,
         req->initiateTranslation();
     }
 
+    CSPRINT(Translation, inst, "completed: %d; access: %d\n",
+            req->isTranslationComplete(), req->isMemAccessRequired());
+
     /* This is the place were instructions get the effAddr. */
     if (req->isTranslationComplete()) {
+        if (inst->isEagerIssued()) {
+            inst->setEagerTranslated();
+            req->setEagerTranslated();
+        }
+
         if (req->isMemAccessRequired()) {
             inst->effAddr = req->getVaddr();
             inst->effSize = size;
@@ -982,6 +1008,25 @@ LSQ<Impl>::SingleDataRequest::recvTimingResp(PacketPtr pkt)
 {
     assert(_numOutstandingPackets == 1);
     auto state = dynamic_cast<LSQSenderState*>(pkt->senderState);
+
+    if (GCONFIGS.hw == utils::DOM &&
+        pkt->isSpeculative() && pkt->isRead() &&
+        !pkt->isSpecL1Hit()) {
+        assert(pkt->isSpecReqSent());
+        _specL1MissStatus[0] = true;
+        _specL1MissCnt++;
+        _packets[0]->convertSpecReadToRead();
+        lsqUnit()->delayedReqs.insert(this);
+        setSpecL1Miss();
+
+        DSTATE(DelaySingleReq, _senderState->inst);
+        return false;
+    }
+
+    if (isSpeculative()) {
+        _senderState->inst->setSpecL1Hit();
+    }
+
     flags.set(Flag::Complete);
     state->outstanding--;
     assert(pkt == _packets.front());
@@ -998,23 +1043,53 @@ LSQ<Impl>::SplitDataRequest::recvTimingResp(PacketPtr pkt)
     while (pktIdx < _packets.size() && pkt != _packets[pktIdx])
         pktIdx++;
     assert(pktIdx < _packets.size());
-    numReceivedPackets++;
-    state->outstanding--;
-    if (numReceivedPackets == _packets.size()) {
-        flags.set(Flag::Complete);
-        /* Assemble packets. */
-        PacketPtr resp = isLoad()
-            ? Packet::createRead(mainReq)
-            : Packet::createWrite(mainReq);
-        if (isLoad())
-            resp->dataStatic(_inst->memData);
-        else
-            resp->dataStatic(_data);
-        resp->senderState = _senderState;
-        _port.completeDataAccess(resp);
-        delete resp;
+
+    bool ret = true;
+    if (GCONFIGS.hw == utils::DOM &&
+        pkt->isSpeculative() && pkt->isRead() &&
+        !pkt->isSpecL1Hit()) {
+        assert(pkt->isSpecReqSent());
+        _specL1MissStatus[pktIdx] = true;
+        _specL1MissCnt++;
+        _packets[pktIdx]->convertSpecReadToRead();
+        setSpecL1Miss();
+        ret = false;
+    } else {
+        numReceivedPackets++;
+        state->outstanding--;
+        if (numReceivedPackets == _packets.size()) {
+            flags.set(Flag::Complete);
+            /* Assemble packets. */
+            PacketPtr resp = isLoad()
+                ? Packet::createRead(mainReq)
+                : Packet::createWrite(mainReq);
+            if (isLoad())
+                resp->dataStatic(_inst->memData);
+            else
+                resp->dataStatic(_data);
+            resp->senderState = _senderState;
+            _port.completeDataAccess(resp);
+            delete resp;
+        }
     }
-    return true;
+
+    if (hasSpecL1Miss()) {
+        // delay the req after every packet has arrived
+        if (numReceivedPackets + _specL1MissCnt == _packets.size()) {
+            DSTATE(DelaySplitReq, _senderState->inst);
+            lsqUnit()->delayedReqs.insert(this);
+            if (_mainPacket->isSpeculative()) {
+                _mainPacket->convertSpecReadToRead();
+            }
+        }
+    } else {
+        assert(_specL1MissCnt == 0);
+        if (isSpeculative() && numReceivedPackets == _packets.size()) {
+            _senderState->inst->setSpecL1Hit();
+        }
+    }
+
+    return ret;
 }
 
 template<class Impl>
@@ -1024,12 +1099,19 @@ LSQ<Impl>::SingleDataRequest::buildPackets()
     assert(_senderState);
     /* Retries do not create new packets. */
     if (_packets.size() == 0) {
-        _packets.push_back(
-                isLoad()
-                    ?  Packet::createRead(request())
-                    :  Packet::createWrite(request()));
+        if (isLoad()) {
+            if (GCONFIGS.hw == utils::DOM && isSpeculative()) {
+                DSTATE(SpecRead, _senderState->inst);
+                _packets.push_back(Packet::createSpecRead(request()));
+            } else {
+                _packets.push_back(Packet::createRead(request()));
+            }
+        } else {
+            _packets.push_back(Packet::createWrite(request()));
+        }
         _packets.back()->dataStatic(_inst->memData);
         _packets.back()->senderState = _senderState;
+        _specL1MissStatus.push_back(false);
 
         // hardware transactional memory
         // If request originates in a transaction (not necessarily a HtmCmd),
@@ -1061,7 +1143,11 @@ LSQ<Impl>::SplitDataRequest::buildPackets()
     if (_packets.size() == 0) {
         /* New stuff */
         if (isLoad()) {
-            _mainPacket = Packet::createRead(mainReq);
+            if (GCONFIGS.hw == utils::DOM && isSpeculative()) {
+                _mainPacket = Packet::createSpecRead(mainReq);
+            } else {
+                _mainPacket = Packet::createRead(mainReq);
+            }
             _mainPacket->dataStatic(_inst->memData);
 
             // hardware transactional memory
@@ -1081,8 +1167,17 @@ LSQ<Impl>::SplitDataRequest::buildPackets()
         }
         for (int i = 0; i < _requests.size() && _fault[i] == NoFault; i++) {
             RequestPtr r = _requests[i];
-            PacketPtr pkt = isLoad() ? Packet::createRead(r)
-                                     : Packet::createWrite(r);
+            PacketPtr pkt;
+            if (isLoad()) {
+                if (GCONFIGS.hw == utils::DOM && isSpeculative()) {
+                    pkt = Packet::createSpecRead(r);
+                } else {
+                    pkt = Packet::createRead(r);
+                }
+            } else {
+                pkt = Packet::createWrite(r);
+            }
+
             ptrdiff_t offset = r->getVaddr() - base_address;
             if (isLoad()) {
                 pkt->dataStatic(_inst->memData + offset);
@@ -1095,6 +1190,7 @@ LSQ<Impl>::SplitDataRequest::buildPackets()
             }
             pkt->senderState = _senderState;
             _packets.push_back(pkt);
+            _specL1MissStatus.push_back(false);
 
             // hardware transactional memory
             // If request originates in a transaction,
@@ -1119,11 +1215,55 @@ LSQ<Impl>::SplitDataRequest::buildPackets()
 
 template<class Impl>
 void
+LSQ<Impl>::SingleDataRequest::reIssue() {
+    assert(hasSpecL1Miss() && isLoad() && !isReIssued());
+    assert(!_packets[0]->isSpeculative());
+    resetSpeculative();
+    if (lsqUnit()->trySendPacket(true, _packets[0])) {
+        setReIssued();
+        _specL1MissStatus[0] = false;
+        _specL1MissCnt--;
+        DSTATE(ReIssueSingleReq, _senderState->inst);
+        resetSpecL1Miss();
+    }
+}
+
+template<class Impl>
+void
+LSQ<Impl>::SplitDataRequest::reIssue() {
+    assert(hasSpecL1Miss() && isLoad() && !isReIssued());
+    resetSpeculative();
+    bool _reIssued = true;
+    for (size_t idx = 0; idx < _packets.size() && _specL1MissCnt; idx++) {
+        if (_specL1MissStatus[idx]) {
+            assert(!_packets[idx]->isSpeculative());
+            if (lsqUnit()->trySendPacket(true, _packets[idx])) {
+                _specL1MissStatus[idx] = false;
+                _specL1MissCnt--;
+            }
+            else {
+                _reIssued = false;
+                break; // if LSQ is busy, no need to try for other packets
+            }
+        }
+    }
+
+    if (_reIssued) {
+        DSTATE(ReIssueSplitReq, _senderState->inst);
+        setReIssued();
+        resetSpecL1Miss();
+    }
+}
+
+template<class Impl>
+void
 LSQ<Impl>::SingleDataRequest::sendPacketToCache()
 {
     assert(_numOutstandingPackets == 0);
     if (lsqUnit()->trySendPacket(isLoad(), _packets.at(0)))
         _numOutstandingPackets = 1;
+
+    CSPRINT(SendPacket, _inst, "isSent: %d\n", isSent());
 }
 
 template<class Impl>
@@ -1136,6 +1276,8 @@ LSQ<Impl>::SplitDataRequest::sendPacketToCache()
                 _packets.at(numReceivedPackets + _numOutstandingPackets))) {
         _numOutstandingPackets++;
     }
+
+    CSPRINT(SendPackets, _inst, "isSent: %d\n", isSent());
 }
 
 template<class Impl>

@@ -25,6 +25,7 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import sys
 import math
 import m5
 from m5.objects import *
@@ -46,6 +47,9 @@ def create_system(options, full_system, system, dma_ports, bootmem,
 
     if buildEnv['PROTOCOL'] != 'MESI_Two_Level':
         fatal("This script requires the MESI_Two_Level protocol to be built.")
+
+    sys.stderr.write(
+        "[\033[32m INFO\033[0m] L1 Prefetcher Enabled: {}\n".format(options.l1_prefetch))
 
     cpu_sequencers = []
 
@@ -100,7 +104,7 @@ def create_system(options, full_system, system, dma_ports, bootmem,
                                       ruby_system = ruby_system,
                                       clk_domain = clk_domain,
                                       transitions_per_cycle = options.ports,
-                                      enable_prefetch = False)
+                                      enable_prefetch = options.l1_prefetch)
 
         cpu_seq = RubySequencer(version = i, icache = l1i_cache,
                                 dcache = l1d_cache, clk_domain = clk_domain,
@@ -130,8 +134,12 @@ def create_system(options, full_system, system, dma_ports, bootmem,
         l1_cntrl.responseToL1Cache = MessageBuffer()
         l1_cntrl.responseToL1Cache.slave = ruby_system.network.master
 
+    # if options.use_default_slice_hash:
+    #     l2_index_start = block_size_bits + l2_bits
+    # else:
 
-    l2_index_start = block_size_bits + l2_bits
+    # use Haswell slice hash
+    l2_index_start = block_size_bits
 
     for i in range(options.num_l2caches):
         #

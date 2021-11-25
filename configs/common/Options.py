@@ -272,7 +272,7 @@ def addCommonOptions(parser):
 
     # Run duration options
     parser.add_option("-I", "--maxinsts", action="store", type="int",
-                      default=None, help="""Total number of instructions to
+                      default=0, help="""Total number of instructions to
                                             simulate (default: run forever)""")
     parser.add_option("--work-item-id", action="store", type="int",
                       help="the specific work id for exit & checkpointing")
@@ -369,6 +369,58 @@ def addCommonOptions(parser):
         "that are present under any of the roots. If not given, dump all "
         "stats. "
     )
+
+
+def addCustomOptions(parser, is_se=True):
+    parser.add_option('--hw', type='choice', choices=['Unsafe', 'Fence', 'DOM', 'STT'],
+                      help='Hardware scheme', default='Unsafe')
+    parser.add_option('--threat-model', type='choice', choices=['Unsafe', 'Spectre',
+                      'Comprehensive'], help='Threat model', default='Unsafe')
+    parser.add_option('--delay-inv-ack', action='store_true',
+                      help='Delay invalidation ack')
+    parser.add_option('--delay-wb', action='store_true',
+                      help='Delay WB of squashing inst until OSP')
+    parser.add_option('--needsTSO', action='store_true', help='Use TSO')
+    parser.add_option('--l1-prefetch', action='store_true', default=False,
+                      help='Enable HW prefetching of L1 controller in Ruby')
+
+    # NSR related
+    parser.add_option('--l2-vpartition', action="store", type="int", default=1,
+                      help="Number of virtual l2 partition")
+    parser.add_option('--eager-translation', action="store_true",
+                      help="Eagerly translate store addresses")
+
+    # CST related
+    parser.add_option('--l1d-cst', action='store', default='16X6', help='#Entry X #Record')
+    parser.add_option('--l2-cst', action='store', default='40X2', help='#Entry X #Record')
+    parser.add_option('--entry-cam', action='store_true', help='Use CAM to index entry')
+    parser.add_option('--cst-record', action='store', type=int, default=12,
+                      help='CST record addr size, 42 bit is no compression')
+
+    # CLT related
+    parser.add_option('--clt-size', action='store', type='int', default=4)
+
+    # SE related
+    if is_se:
+        parser.add_option("--simpt-ckpt", action="store", default=None,
+                        type="int", help="Specify simpoint checkpoint ID")
+        parser.add_option("--benchmark", default="",
+                          action="store", type="string", help="benchmark")
+        parser.add_option("--bench-stdout", default="", action="store",
+                          type="string", help="Path to benchmark stdout")
+        parser.add_option("--bench-stderr", default="", action="store",
+                          type="string", help="Path to benchmark stderr")
+
+    #debug related
+    parser.add_option("--perf-counter", action="store_true",
+                      help="use perf counter to collect per static insn stats")
+    parser.add_option("--dstate-start", default=0, action="store",
+                      type=int, help="minimun seqNum for invoking DPRINTF")
+    parser.add_option("--dstate-end", default=0, action="store",
+                      type=int, help="maximum seqNum for invoking DPRINTF")
+    parser.add_option("--spec-breakdown", action="store", type="choice",
+                      default="", choices=["", "stld", "except"],
+                      help="Breakdown different speculation in Comprehensive")
 
 
 def addSEOptions(parser):

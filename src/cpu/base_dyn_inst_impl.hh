@@ -53,6 +53,7 @@
 #include "cpu/exetrace.hh"
 #include "debug/DynInst.hh"
 #include "debug/IQ.hh"
+#include "debug/SQUASH.hh"
 #include "mem/request.hh"
 #include "sim/faults.hh"
 
@@ -135,6 +136,41 @@ BaseDynInst<Impl>::initVars()
     cpu->snList.insert(seqNum);
 #endif
 
+    if (isLoad())
+        typeCode = 'L';
+    else if (isStore())
+        typeCode = 'S';
+    else if (isControl())
+        typeCode = 'C';
+    else
+        typeCode = '*';
+
+    switch (GCONFIGS.threatModel) {
+        case utils::Unsafe:
+            isSquash = false;
+            break;
+        case utils::Spectre:
+            isSquash = isCondCtrl() || isIndirectCtrl() || isReturn() ||
+                       isCall() || isSyscall();
+            break;
+        case utils::Comprehensive:
+            /* Technically, squashing instructions in the comprehensive
+             * model should include excepting instructions. But arguably,
+             * excepting instructions only affact when an instruction
+             * reaches VP but not ESP. So, we separate excepting instructions
+             * from squashing instructions, and explicitly check for possible
+             * exceptions during VP status update in the ROB */
+            isSquash = isCondCtrl() || isIndirectCtrl() || isReturn() || isCall() ||
+                       isSyscall() || (isStore() && !isDataPrefetch());
+
+            // only consider loads as squashing in full comprehensive mode
+            if (GCONFIGS.specBreakdown > utils::EXCEPTION) {
+                isSquash = (isLoad() && !isDataPrefetch()) || isSquash;
+            }
+            break;
+        default:
+            panic("Invalid threat model!");
+    }
 }
 
 template <class Impl>
@@ -163,7 +199,6 @@ BaseDynInst<Impl>::~BaseDynInst()
 
 }
 
-#ifdef DEBUG
 template <class Impl>
 void
 BaseDynInst<Impl>::dumpSNList()
@@ -177,7 +212,6 @@ BaseDynInst<Impl>::dumpSNList()
         sn_it++;
     }
 }
-#endif
 
 template <class Impl>
 void
@@ -241,7 +275,21 @@ template <class Impl>
 void
 BaseDynInst<Impl>::setSquashed()
 {
+    if (GCONFIGS.threatModel != utils::Unsafe) {
+        if (isSpeculative() && isTransmitter()) {
+            if (isReachedESP()) cpu->squashedESP += 1;
+            if (isReachedOSP()) cpu->squashedOSP += 1;
+            if (isReachedVP()) {
+                CCSPRINT(SQUASH, BadSquash, this, " squashed: %d\n",
+                         cpu->squashedVP.value());
+                cpu->squashedVP += 1;
+            }
+        }
+    }
+
     status.set(Squashed);
+
+    DSTATE(Squashed, this);
 
     if (!isPinnedRegsRenamed() || isPinnedRegsSquashDone())
         return;

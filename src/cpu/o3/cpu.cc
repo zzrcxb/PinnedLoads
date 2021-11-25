@@ -40,6 +40,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <map>
+#include <string>
+
 #include "cpu/o3/cpu.hh"
 
 #include "arch/generic/traits.hh"
@@ -62,14 +65,162 @@
 #include "sim/stat_control.hh"
 #include "sim/system.hh"
 
+#include "cpu/global_utils.hh"
+#include "cpu/colors.hh"
+
 struct BaseCPUParams;
 
 using namespace TheISA;
 using namespace std;
+using bridge::GCONFIGS;
 
-BaseO3CPU::BaseO3CPU(BaseCPUParams *params)
-    : BaseCPU(params)
+PerfCounter PERF_CNT;
+
+BaseO3CPU::BaseO3CPU(BaseCPUParams *oparams)
+    : BaseCPU(oparams)
 {
+    auto *params = dynamic_cast<DerivO3CPUParams *>(oparams);
+    if (params) {
+        GCONFIGS.HWName = params->HWName;
+        GCONFIGS.threatModelName = params->threatModelName;
+        GCONFIGS.ISAName = params->ISAName;
+
+        map<std::string, utils::HWType> availableHW = {
+            {"Unsafe", utils::UNSAFE_CORE},
+            {"DOM", utils::DOM},
+            {"Fence", utils::FENCE},
+            {"STT", utils::STT}};
+        GCONFIGS.hw = availableHW.at(GCONFIGS.HWName);
+
+        map<std::string, utils::ThreatModelType> availableTM = {
+            {"Unsafe", utils::Unsafe},
+            {"Spectre", utils::Spectre},
+            {"Comprehensive", utils::Comprehensive}};
+        GCONFIGS.threatModel = availableTM.at(GCONFIGS.threatModelName);
+
+        map<std::string, utils::SysISA> availableISA = {
+            {"x86", utils::X86},
+            {"arm", utils::ARM}
+        };
+        GCONFIGS.ISA = availableISA.at(GCONFIGS.ISAName);
+
+        GCONFIGS.delayInvAck = params->delayInvAck;
+        GCONFIGS.delayWB = params->delayWB;
+        GCONFIGS.needsTSO = params->needsTSO;
+
+        if (GCONFIGS.delayInvAck && (GCONFIGS.threatModel != utils::Comprehensive)) {
+            panic("delay-inv-ack is only meaningful in Comprehensive model");
+        }
+
+        GCONFIGS.outputDir = params->outputDir;
+        GCONFIGS.maxInsts = params->maxInsts;
+        GCONFIGS.maxTicks = params->maxTicks;
+
+        GCONFIGS.dumpROB = params->dumpROB;
+        GCONFIGS.ROBDumpPath = params->ROBDumpPath;
+
+        GCONFIGS.L1DSize  = params->L1DSize;
+        GCONFIGS.L1DAssoc = params->L1DAssoc;
+        GCONFIGS.L2Size   = params->L2Size;
+        GCONFIGS.L2Assoc  = params->L2Assoc;
+        GCONFIGS.numL2    = params->numL2;
+        GCONFIGS.L2VPartition  = params->L2VPartition;
+        GCONFIGS.cachelineSize = params->cachelineSize;
+        GCONFIGS.eagerTranslation = params->eagerTranslation;
+
+        GCONFIGS.L1DCSTEntryCnt = params->L1DCSTEntryCnt;
+        GCONFIGS.L1DCSTRecordCnt = params->L1DCSTRecordCnt;
+        GCONFIGS.L2CSTEntryCnt = params->L2CSTEntryCnt;
+        GCONFIGS.L2CSTRecordCnt = params->L2CSTRecordCnt;
+        GCONFIGS.entryUseCAM = params->entryUseCAM;
+        GCONFIGS.CSTRecordSize = params->CSTRecord;
+        GCONFIGS.compressCST = GCONFIGS.CSTRecordSize != 42;
+
+        GCONFIGS.CLTSize = params->CLTSize;
+
+        GCONFIGS.collectPerfStats = params->collectPerfStats;
+        GCONFIGS.lowerSeqNum = params->lowerSeqNum;
+        GCONFIGS.hasLowerBound = GCONFIGS.lowerSeqNum != 0;
+        GCONFIGS.upperSeqNum = params->upperSeqNum;
+        GCONFIGS.hasUpperBound = GCONFIGS.upperSeqNum != 0;
+        GCONFIGS.youngestSeqNum = 0;
+
+        map<std::string, utils::SpecBreakdown> availBreakdown = {
+            {"", utils::SBD_DISABLED},
+            {"stld", utils::STLD_FWD},
+            {"except", utils::EXCEPTION}
+        };
+        GCONFIGS.specBreakdown = availBreakdown.at(params->specBreakdown);
+
+        if (GCONFIGS.specBreakdown != utils::SBD_DISABLED &&
+            GCONFIGS.threatModel != utils::Comprehensive) {
+            panic("Speculation breakdown is only valid with comprehensive");
+        }
+
+        if ((GCONFIGS.hw == utils::UNSAFE_CORE) ^ (GCONFIGS.threatModel == utils::Unsafe)) {
+            panic("An unsafe core can only use unsafe threat model & "
+                  "unsafe threat model can only be applied to an unsafe core!");
+        }
+
+        if ((GCONFIGS.hw != utils::UNSAFE_CORE) && (GCONFIGS.threatModel == utils::Unsafe)) {
+            panic("Secure schemes cannot use an unsafe threat model!");
+        }
+
+        bridge::TICKS_PER_CYCLE = cyclesToTicks(Cycles(1));
+        float freq = (frequency() / 10000000u) / 100.0f;
+
+        if (!bridge::CPU_PROMPTED) {
+            cerr << "------------------------ INFO ------------------------"
+                << endl
+                << ZINFO
+                << "Clock Freq: " << BLUE << freq << "GHz\t"
+                << bridge::TICKS_PER_CYCLE << " ticks per cycle" << RESET
+                << endl
+                << ZINFO
+                << "Threat Model: " << BLUE << GCONFIGS.threatModelName << RESET
+                << endl
+                << ZINFO
+                << "Hardware: " << BLUE << GCONFIGS.HWName << RESET
+                << endl
+                << ZINFO
+                << "ISA: " << BLUE << GCONFIGS.ISAName << RESET
+                << endl
+                << ZINFO
+                << "Consistency Model: " << BLUE
+                << (GCONFIGS.needsTSO ? "TSO" : "RC") << RESET
+                << endl
+                << ZINFO
+                << "Eager Translation: " << BLUE
+                << (GCONFIGS.eagerTranslation ? "Enabled" : "Disabled") << RESET
+                << endl
+                << ZINFO
+                << "Delay Inv. Ack.: " << BLUE
+                << (GCONFIGS.delayInvAck ? "Enabled" : "Disabled") << RESET
+                << endl
+                << ZINFO
+                << "Delay Writeback: " << BLUE
+                << (GCONFIGS.delayWB ? "Enabled" : "Disabled") << RESET
+                << endl
+                << "------------------------------------------------------"
+                << endl;
+
+            if (GCONFIGS.dumpROB) {
+                cerr << ZWARN
+                    << "Dumping ROB while simulating. "
+                    << "Simulation could be extremely slow and use huge amount of disk space"
+                    << endl;
+            }
+
+            if (GCONFIGS.specBreakdown != utils::SBD_DISABLED) {
+                cerr << ZWARN
+                     << "Breakdown speculations in Comprehensive model. Level: "
+                     << params->specBreakdown
+                     << endl;
+            }
+
+            bridge::CPU_PROMPTED = true;
+        }
+    }
 }
 
 void
@@ -502,6 +653,41 @@ FullO3CPU<Impl>::regStats()
         .name(name() + ".misc_regfile_writes")
         .desc("number of misc regfile writes")
         .prereq(miscRegfileWrites);
+
+    earlyOSPDueToDelayAck
+        .name(name() + ".earlyOSPDueToDelayAck")
+        .desc("number of loads reach OSP earlier due to delay inv ack")
+        .prereq(earlyOSPDueToDelayAck);
+
+    squashedESP
+        .name(name() + ".squashedESP")
+        .desc("number of squashed transmitters that have reached ESP")
+        .prereq(squashedESP);
+
+    squashedOSP
+        .name(name() + ".squashedOSP")
+        .desc("number of squashed transmitters that have reached OSP")
+        .prereq(squashedOSP);
+
+    squashedVP
+        .name(name() + ".squashedVP")
+        .desc("number of squashed transmitters that have reached VP")
+        .prereq(squashedVP);
+
+    unSquashableNotReadyVP
+        .name(name() + ".unSquashableNotReadyVP")
+        .desc("number of un-squashable-ready checks that failed due to no reaching VP")
+        .prereq(unSquashableNotReadyVP);
+
+    unSquashableNotReadyExcept
+        .name(name() + ".unSquashableNotReadyExcept")
+        .desc("number of un-squashable-ready checks that failed due to under excepting inst")
+        .prereq(unSquashableNotReadyExcept);
+
+    unSquashableNotReadyData
+        .name(name() + ".unSquashableNotReadyData")
+        .desc("number of un-squashable-ready checks that failed due to not receiving data")
+        .prereq(unSquashableNotReadyData);
 }
 
 template <class Impl>

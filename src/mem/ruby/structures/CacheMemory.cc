@@ -48,6 +48,7 @@
 #include "debug/RubyCacheTrace.hh"
 #include "debug/RubyResourceStalls.hh"
 #include "debug/RubyStats.hh"
+#include "debug/RubyTracer.hh"
 #include "mem/cache/replacement_policies/weighted_lru_rp.hh"
 #include "mem/ruby/protocol/AccessPermission.hh"
 #include "mem/ruby/system/RubySystem.hh"
@@ -84,6 +85,12 @@ CacheMemory::CacheMemory(const Params *p)
     m_block_size = p->block_size;  // may be 0 at this point. Updated in init()
     m_use_occupancy = dynamic_cast<WeightedLRUPolicy*>(
                                     m_replacementPolicy_ptr) ? true : false;
+    m_partitioned = p->partitioned;
+    m_num_partition = p->partition_num;
+    m_partition_size = m_cache_assoc / p->partition_num;
+    panic_if(m_cache_assoc % p->partition_num != 0,
+             "Cache assoc %d cannot be divided by # of partition %u\n",
+             m_cache_assoc, m_num_partition);
 }
 
 void
@@ -198,7 +205,9 @@ CacheMemory::tryCacheAccess(Addr address, RubyRequestType type,
             return true;
         }
         if ((entry->m_Permission == AccessPermission_Read_Only) &&
-            (type == RubyRequestType_LD || type == RubyRequestType_IFETCH)) {
+            (type == RubyRequestType_LD ||
+             type == RubyRequestType_IFETCH ||
+             type == RubyRequestType_SPEC_LD)) {
             return true;
         }
         // The line must not be accessible
@@ -246,37 +255,70 @@ CacheMemory::isTagPresent(Addr address) const
 bool
 CacheMemory::cacheAvail(Addr address) const
 {
+    return cacheAvail(address, 0u);
+}
+
+bool
+CacheMemory::cacheAvail(Addr address, NodeID nid) const
+{
     assert(address == makeLineAddress(address));
 
     int64_t cacheSet = addressToCacheSet(address);
 
+    auto range = getPartitionRange(nid);
+    uint p_start = range.first, p_end = range.second;
+
     for (int i = 0; i < m_cache_assoc; i++) {
         AbstractCacheEntry* entry = m_cache[cacheSet][i];
-        if (entry != NULL) {
-            if (entry->m_Address == address ||
-                entry->m_Permission == AccessPermission_NotPresent) {
-                // Already in the cache or we found an empty entry
-                return true;
-            }
-        } else {
+        if (entry != nullptr && entry->m_Address == address) {
+            return true; // the cache set contains the entry
+        }
+    }
+
+    for (int i = p_start; i <= p_end; i++) {
+        AbstractCacheEntry* entry = m_cache[cacheSet][i];
+        if (entry == nullptr ||
+            entry->m_Permission == AccessPermission_NotPresent) {
+            // the way in the partition is not present or empty
             return true;
         }
     }
     return false;
 }
 
+bool
+CacheMemory::isUnSquashable(Addr address) const {
+    assert(address == makeLineAddress(address));
+    const AbstractCacheEntry* const entry = lookup(address);
+    if (entry) {
+        return entry->isUnSquashable();
+    } else {
+        // not present
+        return false;
+    }
+}
+
 AbstractCacheEntry*
 CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
+{
+    return allocate(address, entry, 0u);
+}
+
+AbstractCacheEntry*
+CacheMemory::allocate(Addr address, AbstractCacheEntry *entry, NodeID nid)
 {
     assert(address == makeLineAddress(address));
     assert(!isTagPresent(address));
     assert(cacheAvail(address));
     DPRINTF(RubyCache, "address: %#x\n", address);
 
+    auto p_range = getPartitionRange(nid);
+    uint p_start = p_range.first, p_end = p_range.second;
+
     // Find the first open slot
     int64_t cacheSet = addressToCacheSet(address);
     std::vector<AbstractCacheEntry*> &set = m_cache[cacheSet];
-    for (int i = 0; i < m_cache_assoc; i++) {
+    for (int i = p_start; i <= p_end; i++) {
         if (!set[i] || set[i]->m_Permission == AccessPermission_NotPresent) {
             if (set[i] && (set[i] != entry)) {
                 warn_once("This protocol contains a cache entry handling bug: "
@@ -324,15 +366,46 @@ CacheMemory::deallocate(Addr address)
 Addr
 CacheMemory::cacheProbe(Addr address) const
 {
+    return cacheProbe(address, 0u);
+}
+
+Addr
+CacheMemory::cacheProbe(Addr address, NodeID nid) const
+{
     assert(address == makeLineAddress(address));
     assert(!cacheAvail(address));
+    assert(!m_partitioned || nid < m_num_partition);
 
     int64_t cacheSet = addressToCacheSet(address);
+
+    auto replaceable = [cacheSet, nid, this](uint idx) {
+        if (isUnSquashable(m_cache[cacheSet][idx]->m_Address)) {
+            return false;
+        } else {
+            auto range = getPartitionRange(nid);
+            return idx >= range.first && idx <= range.second;
+        }
+    };
+
     std::vector<ReplaceableEntry*> candidates;
     for (int i = 0; i < m_cache_assoc; i++) {
-        candidates.push_back(static_cast<ReplaceableEntry*>(
-                                                       m_cache[cacheSet][i]));
+        if (replaceable(i)) {
+            candidates.push_back(static_cast<ReplaceableEntry*>(
+                                                        m_cache[cacheSet][i]));
+        } else {
+            DPRINTF(RubyTracer, "Line %d: %p unreplaceable\n",
+                    i, m_cache[cacheSet][i]->m_Address);
+        }
     }
+
+    if (candidates.empty()) {
+        // fallback to normal replacement without considering locking
+        for (int i = 0; i < m_cache_assoc; i++) {
+            candidates.push_back(static_cast<ReplaceableEntry*>(
+                                                        m_cache[cacheSet][i]));
+        }
+    }
+
     return m_cache[cacheSet][m_replacementPolicy_ptr->
                         getVictim(candidates)->getWay()]->m_Address;
 }

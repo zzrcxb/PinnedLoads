@@ -300,6 +300,7 @@ def build_drive_system(np):
 parser = optparse.OptionParser()
 Options.addCommonOptions(parser)
 Options.addFSOptions(parser)
+Options.addCustomOptions(parser, is_se=False)
 
 # Add the ruby specific and protocol specific options
 if '--ruby' in sys.argv:

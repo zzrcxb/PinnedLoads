@@ -49,6 +49,9 @@
 #include <cassert>
 
 #include "debug/RubySlicc.hh"
+#include "debug/RubyTracer.hh"
+#include "debug/NSR.hh"
+#include "debug/DEV.hh"
 #include "mem/packet.hh"
 #include "mem/ruby/common/Address.hh"
 #include "mem/ruby/common/BoolVec.hh"
