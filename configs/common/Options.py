@@ -391,7 +391,7 @@ def addCustomOptions(parser, is_se=True):
                       help="Eagerly translate store addresses")
 
     # CST related
-    parser.add_option('--l1d-cst', action='store', default='16X6', help='#Entry X #Record')
+    parser.add_option('--l1d-cst', action='store', default='12X8', help='#Entry X #Record')
     parser.add_option('--l2-cst', action='store', default='40X2', help='#Entry X #Record')
     parser.add_option('--entry-cam', action='store_true', help='Use CAM to index entry')
     parser.add_option('--cst-record', action='store', type=int, default=12,

@@ -78,7 +78,7 @@ def config_O3CPU(cpu_cls, cpu_list, options):
         cpu.threatModelName = options.threat_model
         cpu.needsTSO = options.needsTSO
         cpu.delayInvAck = options.delay_inv_ack
-        cpu.delayWB = options.delay_wb
+        cpu.delayWB = cpu.HWName == 'Fence'
         if cpu.delayInvAck:
             assert(cpu.needsTSO)
 
