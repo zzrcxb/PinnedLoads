@@ -1,0 +1,294 @@
+#! /usr/bin/env python3
+
+import os
+import re
+import time
+import shutil
+import htcondor
+import pandas as pd
+
+from pathlib import Path
+from itertools import product
+from typing import List, Tuple
+from collections import defaultdict
+
+GEM5_ROOT = None
+M5_PATH = None
+WORKLOADS_ROOT = None
+
+DEFENSES = ['Fence', 'DOM', 'STT']
+THREAT_M = ['Spectre', 'LP', 'EP', 'Comprehensive']
+BREAKDOWN = ['stld', 'except']
+
+SCRIPT_TEMPLATE = """#! /bin/bash
+rm -f {OUTPUT}/QUEUED
+touch {OUTPUT}/RUNNING
+
+export GEM5_ROOT={GEM5_ROOT}
+export M5_PATH={M5_PATH}
+{SCRIPT} {ARG}
+
+if [ $? != 0 ] || [ ! -s {OUTPUT}/stats.txt ]; then
+    touch {OUTPUT}/ERRORED
+else
+    touch {OUTPUT}/FINISHED
+fi
+
+rm -f {OUTPUT}/RUNNING
+"""
+
+
+def submit_one(script: str, suite: str, bench: str, simpt: int, weight: float,
+               defense: str, mode: str, dry_run: bool=False):
+    pinned_loads = ['LP', 'EP']
+    if mode in BREAKDOWN or mode in pinned_loads:
+        threat = 'Comprehensive'
+    else:
+        threat = mode
+
+    arg = f'-E -b {bench} -s {simpt} -t {threat} -H {defense} --ext={defense}@{mode}'
+    if mode == 'EP':
+        arg += f' -d --l2-par=8'
+    elif mode == 'LP':
+        arg += f' -d --l2-par=1'
+
+    if mode in BREAKDOWN:
+        arg += f' --sbd={mode}'
+
+    if script == 'spec.sh':
+        arg += f' -i {50_000_000}'
+    else:
+        arg += f' -i {25_000_000}'
+
+    arg += f' --suite={WORKLOADS_ROOT / suite}'
+    output_root: Path = GEM5_ROOT / 'output' / f'{defense}@{mode}' / f'{bench}' / f'{simpt}'
+    if output_root.exists():
+        shutil.rmtree(output_root)
+    output_root.mkdir(parents=True)
+
+    with (output_root / 'WEIGHT').open('w') as f:
+        f.write(f'{weight}')
+
+    (output_root / 'QUEUED').touch()
+
+    run_sh = output_root / 'run.sh'
+    with run_sh.open('w') as f:
+        f.write(SCRIPT_TEMPLATE.format(
+            OUTPUT=output_root,
+            GEM5_ROOT=GEM5_ROOT,
+            M5_PATH=M5_PATH,
+            SCRIPT=GEM5_ROOT / 'scripts' / script,
+            ARG=arg
+        ))
+
+    with (output_root / 'SUITE').open('w') as f:
+        f.write(suite)
+
+    if dry_run:
+        print(f'Dry run: {suite}@{bench} {simpt} {defense} {mode}')
+    else:
+        j = htcondor.Submit(dict(
+            universe='vanilla',
+            executable='/bin/bash',
+            arguments=str(run_sh),
+            output=f'{output_root}/condor.out',
+            log=f'{output_root}/condor.log',
+            error=f'{output_root}/condor.err',
+            getenv='true',
+            request_cpus='1',
+            request_memory='2.5GB',
+            nice_user='true',
+            initialdir=str(output_root)
+        ))
+        schedd = htcondor.Schedd()
+        with schedd.transaction() as txn:
+            print(f'Job {j.queue(txn)}: {suite}@{bench} {simpt} {defense} {mode}')
+
+
+def get_benchmark_paths(suite: str):
+    suite_root = WORKLOADS_ROOT / suite
+    if suite == 'SPEC17':
+        run_dir: Path = suite_root / 'run'
+        return sorted([d for d in run_dir.iterdir() if d.is_dir()])
+    else:
+        return sorted([d for d in suite_root.iterdir() if d.is_dir()])
+
+
+def get_bench_weights(bench_path: Path):
+    weight = bench_path / 'results.weights'
+    if weight.exists():
+        with weight.open() as f:
+            return {int(line.split()[1]): float(line.split()[0]) for line in f}
+    else:
+        return defaultdict(lambda: 1)
+
+
+def submitter(args):
+    suite = args.suite
+    script = {
+        'SPEC17': 'spec.sh',
+        'PARSEC': 'parsec.sh',
+        'SPLASH2X': 'parsec.sh'
+    }[suite]
+
+    def find_simpts(bench_path: Path) -> List[int]:
+        if suite == 'SPEC17':
+            simpts = []
+            name = bench_path.name
+            ckpt = bench_path.parent.parent / 'ckpt' / name
+            for d in ckpt.iterdir():
+                if d.is_dir():
+                    match = re.findall(r'cpt.None.SIMP-(\d+)', d.name)
+                    if len(match) == 1:
+                        simpts.append(int(match[0]))
+            return sorted(simpts)
+        else:
+            return [1]
+
+    modes = THREAT_M + BREAKDOWN
+    configs = list(product(DEFENSES, modes))
+    configs.append(('Unsafe', 'Unsafe'))
+
+    cnt = 0
+    for defense, mode in configs:
+        for bench in get_benchmark_paths(suite):
+            # skip barnes and fft due to their unreliable behavior
+            # when inscount is small
+            if bench.name in ['barnes', 'fft']:
+                continue
+            weights = get_bench_weights(bench)
+            for simpt in find_simpts(bench):
+                submit_one(script, suite, bench.name, simpt, weights[simpt],
+                           defense, mode, args.dry)
+                cnt += 1
+                if cnt % 60 == 0:
+                    time.sleep(5)
+
+
+def status_checker(args):
+    config = args.config
+    output = GEM5_ROOT / 'output'
+    configs = [d.name for d in output.iterdir() if d.is_dir()] if config == '*' else [config]
+    summary = [0, 0, 0, 0]
+    for config in configs:
+        errors = len(list((output / config).glob(f'*/*/ERRORED')))
+        running = len(list((output / config).glob(f'*/*/RUNNING')))
+        finished = len(list((output / config).glob(f'*/*/FINISHED')))
+        queued = len(list((output / config).glob(f'*/*/QUEUED')))
+        print(f'{config}:')
+        print(f'\tqueued: {queued}; running: {running};'
+              f' finished: {finished}, errored: {errors}')
+        summary[0] += queued
+        summary[1] += running
+        summary[2] += finished
+        summary[3] += errors
+
+    print('Summary:')
+    print(f'\tQueued: {summary[0]}')
+    print(f'\tRunning: {summary[1]}')
+    print(f'\tFinished: {summary[2]}')
+    print(f'\tErrored: {summary[3]}')
+
+
+def read_cpi_weight(output: Path, suite: str) -> Tuple[int, int, float]:
+    with (output / 'WEIGHT').open() as f:
+        weight = float(f.read())
+
+    with (output / 'stats.txt').open() as f:
+        data = f.read()
+        if suite == 'SPEC17':
+            cpi = float(re.findall(r'system.switch_cpus.cpi_total\s+(\d+\.\d+)',
+                                   data)[0])
+            insts = int(re.findall(r'system.switch_cpus.committedInsts\s+(\d+)',
+                                   data)[0])
+            return int(cpi * insts), insts, weight
+        else:
+            cpis = dict(map(lambda x: (int(x[0]), float(x[1])), re.findall(
+                r'system.switch_cpus(\d+).cpi_total\s+(\d+\.\d+)', data)))
+            insts = dict(map(lambda x: (int(x[0]), int(x[1])), re.findall(
+                r'system.switch_cpus(\d+).committedInsts\s+(\d+)', data)))
+            cycles = sum([inst * cpis.get(k, 0) for k, inst in insts.items()])
+            return int(cycles), sum(insts.values()), weight
+
+
+def collector(args):
+    output: Path = GEM5_ROOT / 'output'
+    modes = THREAT_M + BREAKDOWN
+    results = defaultdict(lambda: defaultdict(dict))
+
+    configs = list(product(DEFENSES, modes))
+    configs.append(('Unsafe', 'Unsafe'))
+    suite_map = dict()
+    for hw, mode in configs:
+        out_dir = output / f'{hw}@{mode}'
+        if not out_dir.exists():
+            print(out_dir, 'does not exist! continue...')
+            continue
+
+        for bench in out_dir.iterdir():
+            if bench.name in ['barnes', 'fft']:
+                continue
+
+            cycle_w = []
+            inst_w = []
+            for simpt in bench.iterdir():
+                if not (simpt / 'stats.txt').exists():
+                    print(f'{simpt}/stats.txt does not exist, skipped...')
+                    continue
+                if bench.name not in suite_map:
+                    with (simpt / 'SUITE').open() as f:
+                        suite = f.read()
+                    suite_map[bench.name] = suite
+                try:
+                    cycles, insts, weight = read_cpi_weight(simpt, suite_map[bench.name])
+                    cycle_w.append(weight * cycles)
+                    inst_w.append(weight * insts)
+                except IndexError:
+                    print(simpt, 'results missing...')
+                    continue
+            cpi = sum(cycle_w) / sum(inst_w)
+            results[hw][mode][bench.name] = cpi
+
+    baselines = results['Unsafe']['Unsafe']
+    benchmarks = sorted(list(suite_map.keys()))
+    indexes = [f'{b}@{suite_map[b]}' for b in benchmarks]
+    perf_configs = list(product(DEFENSES, THREAT_M + BREAKDOWN))
+    data = {f'{hw}@{mode}': [results[hw][mode][bench] / baselines[bench] for bench in benchmarks]
+            for hw, mode in perf_configs}
+    pd.DataFrame(data=data, index=indexes).to_csv('data.csv')
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser('runner')
+    parser.add_argument('--gem5-root', type=str, default=os.getenv('GEM5_ROOT'),
+                        help='Path to gem5 root')
+    parser.add_argument('--m5-path', type=str, default=os.getenv('M5_PATH'),
+                        help='Path to M5 and kernel images')
+    parser.add_argument('--workloads-root', type=str,
+                        default=os.getenv('WORKLOADS_ROOT'),
+                        help='Path to workload directory')
+
+    subparsers = parser.add_subparsers()
+    submit = subparsers.add_parser('submit')
+    submit.add_argument('suite', type=str, help='Benchmark suite',
+                        choices=['SPEC17', 'PARSEC', 'SPLASH2X'])
+    submit.add_argument('-d', '--dry', action='store_true', help='Dry run')
+    submit.set_defaults(func=submitter)
+
+    status = subparsers.add_parser('status')
+    status.add_argument('-c', '--config', type=str, default='*')
+    status.set_defaults(func=status_checker)
+
+    collect = subparsers.add_parser('collect')
+    collect.set_defaults(func=collector)
+
+    args = parser.parse_args()
+
+    assert(args.gem5_root and args.m5_path and args.workloads_root)
+    GEM5_ROOT = Path(args.gem5_root)
+    M5_PATH = Path(args.m5_path)
+    WORKLOADS_ROOT = Path(args.workloads_root)
+
+    args.func(args)

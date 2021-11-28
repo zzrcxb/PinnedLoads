@@ -1,0 +1,289 @@
+#! /usr/bin/env python3
+
+from collections import defaultdict
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from numpy import floor, log10, ceil
+from typing import List, Tuple, Dict
+from itertools import product
+
+
+def calc_centers(size, ncols, width=1):
+    centers = np.arange(0, size * (ncols + 1) * width, (ncols + 1) * width)
+    positions = [centers + ((2 * i) - (ncols - 1)) * (width / 2) for i in range(ncols)]
+    return positions, centers
+
+
+def get_sig_fig(x, sig):
+    ndigit = -int(floor(log10(abs(x)))) - 1 + sig
+    return round(x, ndigit)
+
+
+def get_y_range(min_y: float, max_y: float, ndiv: int = 4, signif: int = 1):
+    diff = max_y - min_y
+    interval = diff / ndiv
+    interval = round(interval, signif)
+    mag = 10 ** floor(log10(abs(interval)))
+    min_y = min_y // mag * mag
+    max_y = max_y // mag * mag + mag
+    return min_y, max_y, interval
+
+
+def append_geomean(data: pd.DataFrame):
+    gmeans = data.to_numpy().prod(axis=0) ** (1 / len(data.index))
+    gmeans = gmeans.reshape((1, len(data.columns)))
+    return data.append(
+        pd.DataFrame(
+            data=gmeans,
+            columns=data.columns,
+            index=['Geo. Mean'])
+    )
+
+
+def get_bench_suites_data(data: pd.DataFrame) -> Dict[str, List[str]]:
+    sort = defaultdict(list)
+    for idx in data.index:
+        bench, suite = idx.split('@')
+        sort[suite].append(bench)
+
+    data.index = [idx.split('@')[0] for idx in data.index]
+
+    for k in list(sort.keys()):
+        sort[k] = sorted(sort[k])
+
+    spec_benches = sort['SPEC17']
+    sp_benches = sort['SPLASH2X'] + sort['PARSEC']
+    data = data.reindex(spec_benches + sp_benches)
+    spec_data = append_geomean(data[:len(spec_benches)])
+    sp_data = append_geomean(data[len(spec_benches):])
+
+    return dict(spec=spec_data, sp=sp_data)
+
+
+def perf_plot_one(ax: plt.Axes, df: pd.DataFrame, scheme, min_y=None,
+                  max_y=None, interval=None, cutoff=None, width=1):
+    nrows, ncols = len(df), len(df.columns)
+    x_poss, x_centers = calc_centers(nrows, ncols, width=width)
+
+    # plot bars with auto divided grey scale
+    for idx, label in enumerate(df):
+        ax.bar(x_poss[idx], df[label].values, align='center', width=width,
+               edgecolor='black', label=label.split('@')[1], color=str(idx * 0.8 / (ncols - 1) + 0.19))
+
+    ax.legend(loc='upper right', fontsize=7, ncol=len(df.columns), bbox_to_anchor=(1.0, 1.06))
+
+    # add labels to x bar
+    ax.set_xticks(x_centers)
+    ax.set_xticklabels(df.index, fontsize=7)
+    ax.set_xlim(x_poss[0][0] - width, x_poss[-1][-1] + width)
+    plt.setp(ax.get_xticklabels(), rotation=30, ha='right', rotation_mode='anchor')
+
+    # auto tuning y range
+    if not min_y: min_y = df.min().min()
+    if not max_y: max_y = df.max().max()
+    if cutoff: max_y = cutoff
+
+    if not interval:
+        _, max_y, interval = get_y_range(1.0, max_y)
+        max_y = ceil((max_y - 1.0) / interval) * interval + 1.0
+
+    mag = floor(log10(abs(interval)))
+    mag = -mag if mag < 0 else 0
+    fmt_s = f'{{:,.{int(mag)}f}}'
+    max_y += 0.0001
+    # fmt y axis
+    ax.set_ylim(min_y, max_y)
+    ax.set_yticks(np.arange(1.0, max_y, interval))
+    ax.set_yticklabels([fmt_s.format(y) for y in ax.get_yticks()], fontsize=7)
+
+    ax2 = ax.twinx()
+    ax2.set_ylim(min_y, max_y)
+    ax2.set_yticks(ax.get_yticks())
+    ax2.set_yticklabels([fmt_s.format(y) for y in ax.get_yticks()], fontsize=7)
+
+    if cutoff:
+        need_labels = []
+        over_threshold = False
+        for idy in range(nrows):
+            for idx, n in enumerate(df):
+                value = df[n][idy]
+                if value >= cutoff:
+                    if over_threshold:
+                        need_labels[-1][0] -= width / 2
+                        need_labels.append([x_poss[idx][idy] + width / 2, cutoff + .02, value])
+                    else:
+                        need_labels.append([x_poss[idx][idy], cutoff + .02, value])
+                    over_threshold = True
+                else:
+                    over_threshold = False
+
+        for x, y, value in need_labels:
+            ax.text(x + width / 3, y, f'{value:.2f}', ha='center', fontsize=7, rotation=30)
+
+    for h in ax.get_yticks()[1:]:
+        ax.axhline(h, color='grey', linewidth=.5, linestyle='--')
+    ax.axhline(1, color='red', linewidth=.5)
+
+    ax.set_ylabel(scheme, fontsize=8)
+
+
+def plot_perf(data: pd.DataFrame):
+    models = ['Comprehensive', 'LP', 'EP', 'Spectre']
+    params = {
+        'spec': {
+            'Fence': (.9, 3.2, .4, None),
+            'DOM': (.9, None, None, None),
+            'STT': (.9, None, None, None)
+        },
+        'sp': {
+            'Fence': (.9, 3.5, .5, None),
+            'DOM': (.9, 2.0, .2, None),
+            'STT': (.9, 2.0, .2, None)
+        }
+    }
+
+    suites = get_bench_suites_data(data)
+    data.index = [i.split('@')[0] for i in data.index]
+    for suite, data in suites.items():
+        fig, axs = plt.subplots(len(params[suite]), 1, sharex=True)
+        plt.subplots_adjust(hspace=0)
+        for idx, (hw, config) in enumerate(params[suite].items()):
+            cols = [f'{hw}@{m}' for m in models]
+            perf_plot_one(axs[idx], data[cols], hw, *config)
+        fig.tight_layout()
+        fig.set_size_inches(9.0, 3.5)
+        fig.savefig(f'perf-{suite}.pdf', bbox_inches='tight')
+
+
+def brkd_plotter(ax: plt.Axes, df: pd.DataFrame, min_y=None, max_y=None,
+                 interval=None, cutoff=None, width=1, no_arch=False):
+    nrows, ncols = len(df), len(df.columns)
+    ncols = 1 if no_arch else 3
+    x_poss, x_centers = calc_centers(nrows, ncols, width=width)
+
+    label_iter = iter(df)
+
+    if not no_arch:
+        ax2 = ax.twinx()
+        label = next(label_iter)
+        ax2.bar(x_poss[1], df[label].values, align='center', width=width, label=label,
+            edgecolor='black', color='0.3')
+
+        label = next(label_iter)
+        ax2.bar(x_poss[2], df[label].values, align='center', width=width, label=label,
+            edgecolor='black', color='0.6')
+
+        ax2.legend(loc='upper right', fontsize=7, ncol=1, bbox_to_anchor=(1.0, 1.03))
+
+    styles = [(.9, '//'), (.7, 'x'), (.5, '+'), (1, '\\\\')]
+    # plot bars with auto divided grey scale
+    for idx, label in enumerate(label_iter):
+        c, h = styles[idx]
+        ax.bar(x_poss[0], df[label].values, align='center', width=width,
+                edgecolor='black', label=label, color=str(c), hatch=h)
+
+    if no_arch:
+        ax.legend(loc='upper right', fontsize=7, ncol=1, bbox_to_anchor=(1.5, 1.02))
+    else:
+        ax.legend(loc='upper center', fontsize=7, ncol=1, bbox_to_anchor=(.7, 1.04))
+
+    # add labels to x bar
+    ax.set_xticks(x_centers)
+    ax.set_xticklabels([s.replace('-', '\n') for s in df.index], fontsize=7)
+    ax.set_xlim(x_poss[0][0] - width, x_poss[-1][-1] + width)
+    # if no_arch:
+    plt.setp(ax.get_xticklabels(), ha='center', fontsize=7)
+    # else:
+        # plt.setp(ax.get_xticklabels(), rotation=30, ha='right', rotation_mode='anchor')
+
+    # auto tuning y range
+    if min_y is None: min_y = df.min().min()
+    if max_y is None: max_y = df.max().max()
+    if cutoff: max_y = cutoff
+
+    if not interval:
+        _, max_y, interval = get_y_range(1.0, max_y)
+        max_y = ceil(max_y / interval) * interval + 1.0
+
+    mag = floor(log10(abs(interval * 100)))
+    mag = -mag if mag < 0 else 0
+    fmt_s = f'{{:,.{mag}%}}'
+
+    max_y += 0.0001
+    # fmt y axis
+    ax.set_ylim(min_y, max_y)
+    ax.set_yticks(np.arange(0.0, max_y, interval))
+    if no_arch:
+        ax.set_yticklabels([fmt_s.format(y) for y in ax.get_yticks()], fontsize=7)
+    else:
+        ax.set_yticklabels([fmt_s.format(y) for y in ax.get_yticks()], fontsize=7)
+
+    if not no_arch:
+        ax2.set_ylim(min_y, max_y)
+        ax2.set_yticks(ax.get_yticks())
+        ax2.set_yticklabels([fmt_s.format(y) for y in ax.get_yticks()], fontsize=7)
+
+    if cutoff:
+        need_labels = []
+        over_threshold = False
+        for idy in range(nrows):
+            for idx, n in enumerate(df):
+                value = df[n][idy]
+                if value >= cutoff:
+                    if over_threshold:
+                        need_labels[-1][0] -= width / 2
+                        need_labels.append([x_poss[0][idy] + width / 2, cutoff + .02, value])
+                    else:
+                        need_labels.append([x_poss[0][idy], cutoff + .02, value])
+                    over_threshold = True
+                else:
+                    over_threshold = False
+
+        for x, y, value in need_labels:
+            ax.text(x + width / 3, y, f'{value:.1%}', ha='center', fontsize=7)
+
+    for h in ax.get_yticks()[1:]:
+        ax.axhline(h, color='grey', linewidth=.5, linestyle='--')
+
+
+def plot_brkd(data: pd.DataFrame):
+    defenses = ['Fence', 'DOM', 'STT']
+    suites = get_bench_suites_data(data)
+    gmeans = dict(SPEC17=suites['spec'][-1:], Parallel=suites['sp'][-1:])
+    modes = {'LP': 'LP', 'EP': 'EP', 'Comprehensive': 'MCV',
+             'except': 'Exception', 'stld': 'Alias Dep.',
+             'Spectre': 'Ctrl Dep.'}
+    index = []
+    results = []
+    for hw, (name, gmean) in product(defenses, gmeans.items()):
+        index.append(f'{hw}-{name}')
+        results.append(gmean[[f'{hw}@{m}' for m in modes]].to_numpy().flatten())
+    data = pd.DataFrame(data=np.array(results) - 1,
+                        columns=modes.values(), index=index)
+    fig, ax = plt.subplots()
+    brkd_plotter(ax, data, interval=.2, cutoff=.8, min_y=0)
+    ax.set_ylabel('Geo. Mean\nExecution Overhead', fontsize=8)
+    fig.tight_layout()
+    fig.set_size_inches(4.0, 1.2)
+    fig.savefig(f'brkd.pdf', bbox_inches='tight')
+    plt.clf()
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser('plotter')
+    parser.add_argument('-f', '--file', type=str, default='data.csv',
+                      help='Name of the input file')
+
+    subparsers = parser.add_subparsers()
+    perf = subparsers.add_parser('perf')
+    perf.set_defaults(func=plot_perf)
+
+    brkd = subparsers.add_parser('breakdown')
+    brkd.set_defaults(func=plot_brkd)
+    args = parser.parse_args()
+
+    args.func(pd.read_csv(args.file, header=0, index_col=0))
