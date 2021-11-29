@@ -2,3 +2,6 @@
 *.tsv
 *.pdf
 *.png
+
+# exclude expected results
+!expected/*.pdf
