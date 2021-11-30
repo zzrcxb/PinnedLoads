@@ -16,20 +16,21 @@ unset BENCHMARK SIMPT SUFFIX EXT L1CST L2CST SUITE_ROOT
 
 MAXINSTS=50000000
 L2VPARTITION=1
-SS_VER="sxs++-cfg12@10"
 THREAT=Unsafe
 HW=Unsafe
 INPUT_SIZE=simmedium
 CKPT_SAMPLE=sample
+IMAGE=disks/x86root-SPLASH-PARSEC.img # relative to M5_PATH
+KERNEL=binaries/vmlinux.x86 # relative to M5_PATH
 
 usage() {
     echo "Usage: parsec.sh"
 }
 
-PARSED_ARGUMENTS=$(getopt -a -n parsec -o hb:s:dDgPt:H:i:fE --long \
-help,bench:,simpt:,dflags:,dstart:,dfile:,threat-model:,hardware:,\
-maxinsts:,l2-par:,delay-inv,delay-wb,ckpt:,eager,ext:,\
-perf,l1-cst:,l2-cst:,cam,record-size:,sbd:,suite: -- "$@")
+PARSED_ARGUMENTS=$(getopt -a -n parsec -o hb:s:dgt:H:i:f --long \
+help,bench:,simpt:,threat-model:,hardware:,\
+maxinsts:,l2-par:,delay-inv,ckpt:,ext:,l1-cst:,l2-cst:,\
+cam,record-size:,sbd:,suite:,image:,kernel: -- "$@")
 
 if [ $? != 0 ]; then
     usage
@@ -56,41 +57,13 @@ do
             echo "Delaying invalidation ack" >&2
             SUFFIX="$SUFFIX --delay-inv-ack"; shift;
             ;;
-        -D | --delay-wb )
-            echo "Delaying writeback" >&2
-            SUFFIX="$SUFFIX --delay-wb"; shift;
-            ;;
-        -E | --eager )
-            echo "Enable eager translation"
-            SUFFIX="$SUFFIX --eager-translation"; shift;
-            ;;
         --ext )
-            echo "Output directory suffix is $2"
+            echo "Output directory prefix is $2"
             EXT=$2; shift 2;
             ;;
         -g )
             echo "Enabled GDB" >&2
             EXEC="gdb --args $EXEC"; shift;
-            ;;
-        --perf )
-            echo "Enabled perf record" >&2
-            EXEC="perf record $EXEC"; shift;
-            ;;
-        --dflags )
-            echo "Using debug flags: $2" >&2
-            EXEC="$EXEC --debug-flags=$2"; shift 2;
-            ;;
-        --dfile )
-            echo "Saving debug file at $2" >&2
-            EXEC="$EXEC --debug-file=$2"; shift 2;
-            ;;
-        --dstart )
-            echo "Starting debug at $2" >&2
-            EXEC="$EXEC --debug-start=$2"; shift 2;
-            ;;
-        -P )
-            echo "Enabled performance counter" >&2
-            SUFFIX="$SUFFIX --perf-counter"; shift;
             ;;
         -t | --threat-model )
             echo "Using $2 as threat model" >&2
@@ -103,6 +76,14 @@ do
         -i | --maxinsts )
             echo "Setting maximum instruction to $2" >&2
             MAXINSTS=$2; shift 2;
+            ;;
+        --image )
+            echo "Using image $2" >&2
+            IMAGE=$2; shift 2;
+            ;;
+        --kernel )
+            echo "Using kernel $2" >&2
+            KERNEL=$2; shift 2;
             ;;
         --l2-par )
             echo "Setting L2 virtual partition size to $2" >&2
@@ -171,25 +152,16 @@ echo SUFFIX: $SUFFIX >&2
 echo Simulation started at $(date) >&2
 echo "" >&2
 
-if [ $(hostname) != "iacoma-perf" ]; then
-    module () {
-        eval $($LMOD_CMD bash "$@") && eval $(${LMOD_SETTARG_CMD:-:} -s sh)
-    }
-    export LD_LIBRARY_PATH=$HOME/bin
-    module load gcc/7.2.0
-fi
-
 $EXEC -d $OUTPUT_DIR \
 $GEM5_ROOT/configs/example/fs.py \
---disk-image=$M5_PATH/disks/x86root-SPLASH-PARSEC.img \
---kernel=$M5_PATH/binaries/vmlinux.x86 \
+--disk-image=$M5_PATH/$IMAGE --kernel=$M5_PATH/$KERNEL \
 --checkpoint-dir=$CKPT_ROOT --checkpoint-restore=$SIMPT \
 --num-cpus=8 --mem-size=2048MB --cpu-type=DerivO3CPU --l1d_size=32kB \
 --l1d_assoc=8 --l1i_assoc=4 --l2_assoc=16 --num-l2caches=8 --num-dirs=8 \
 --l2-vpartition=$L2VPARTITION --needsTSO --ruby --l1-prefetch \
 --threat-model=$THREAT --hw=$HW \
 --network=simple --topology=Mesh_XY --mesh-rows=4 \
---maxinsts=$MAXINSTS --warmup-insts=1000000 $SUFFIX
+--maxinsts=$MAXINSTS --warmup-insts=1000000 --eager-translation $SUFFIX
 
 EXIT_CODE=$?
 

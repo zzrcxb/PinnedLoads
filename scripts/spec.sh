@@ -18,9 +18,9 @@ usage() {
     echo "Usage: spec.sh"
 }
 
-PARSED_ARGUMENTS=$(getopt -a -n spec -o hb:s:dDgPt:H:i:fE --long \
-help,bench:,simpt:,dflags:,dstart:,dfile:,threat-model:,hardware:,\
-maxinsts:,l2-par:,delay-inv,delay-wb,eager,ext:,l1-cst:,l2-cst:,cam,\
+PARSED_ARGUMENTS=$(getopt -a -n spec -o hb:s:dgt:H:i:f --long \
+help,bench:,simpt:,threat-model:,hardware:,\
+maxinsts:,l2-par:,delay-inv,ext:,l1-cst:,l2-cst:,cam,\
 record-size:,sbd:,suite: -- "$@")
 
 if [ $? != 0 ]; then
@@ -44,37 +44,13 @@ do
             echo "Delaying invalidation ack" >&2
             SUFFIX="$SUFFIX --delay-inv-ack"; shift;
             ;;
-        -D | --delay-wb )
-            echo "Delaying writeback" >&2
-            SUFFIX="$SUFFIX --delay-wb"; shift;
-            ;;
-        -E | --eager )
-            echo "Enable eager translation"
-            SUFFIX="$SUFFIX --eager-translation"; shift;
-            ;;
         --ext )
-            echo "Output directory suffix is $2"
+            echo "Output directory prefix is $2"
             EXT=$2; shift 2;
             ;;
         -g )
             echo "Enabled GDB" >&2
             EXEC="gdb --args $EXEC"; shift;
-            ;;
-        --dflags )
-            echo "Using debug flags: $2" >&2
-            EXEC="$EXEC --debug-flags=$2"; shift 2;
-            ;;
-        --dfile )
-            echo "Saving debug file at $2" >&2
-            EXEC="$EXEC --debug-file=$2"; shift 2;
-            ;;
-        --dstart )
-            echo "Starting debug at $2" >&2
-            EXEC="$EXEC --debug-start=$2"; shift 2;
-            ;;
-        -P )
-            echo "Enabled performance counter" >&2
-            SUFFIX="$SUFFIX --perf-counter"; shift;
             ;;
         -t | --threat-model )
             echo "Using $2 as threat model" >&2
@@ -155,14 +131,6 @@ echo SUFFIX: $SUFFIX >&2
 echo Simulation started at $(date) >&2
 echo "" >&2
 
-if [[ $(hostname) == iacoma2* ]]; then
-    module () {
-        eval $($LMOD_CMD bash "$@") && eval $(${LMOD_SETTARG_CMD:-:} -s sh)
-    }
-    export LD_LIBRARY_PATH=$HOME/bin
-    module load gcc/7.2.0
-fi
-
 $EXEC -d $OUTPUT_DIR \
 $GEM5_ROOT/configs/example/se.py --benchmark=$BENCHMARK \
 --num-cpus=1 --mem-size=4096MB --cpu-type=DerivO3CPU \
@@ -172,7 +140,7 @@ $GEM5_ROOT/configs/example/se.py --benchmark=$BENCHMARK \
 --at-instruction --simpt-ckpt=${SIMPT} --checkpoint-restore=1 \
 --threat-model=$THREAT --hw=$HW --checkpoint-dir=$CKPT_ROOT \
 --network=simple --topology=Mesh_XY --mesh-rows=1 \
---warmup-insts=1000000 $SUFFIX
+--warmup-insts=1000000 --eager-translation $SUFFIX
 
 EXIT_CODE=$?
 

@@ -46,7 +46,7 @@ def submit_one(script: str, suite: str, bench: str, simpt: int, weight: float,
     else:
         threat = mode
 
-    arg = f'-E -b {bench} -s {simpt} -t {threat} -H {defense} --ext={defense}@{mode}'
+    arg = f'-b {bench} -s {simpt} -t {threat} -H {defense} --ext={defense}@{mode}'
     if mode == 'EP':
         arg += f' -d --l2-par=8'
     elif mode == 'LP':
