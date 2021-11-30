@@ -139,7 +139,7 @@ instead of 1 billion instructions or reaching the end of ROI.
 Since a full run on one ROI can take several days to finish.
 
 ### Be Patient
-There will be ~4000 jobs in total. On average, a job takes ~20 minutes (SPEC17),
+There will be ~3500 jobs in total. On average, a job takes ~20 minutes (SPEC17),
 ~1 hour (PARSEC & SPLASH2X) to finish.
 So, you can estimate the total execution time based on the number of condor slots you have on your cluster.
 In our environment, which has 80 slots, it takes about 1 day to finish all the jobs.
