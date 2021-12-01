@@ -34,9 +34,9 @@ RUN apt update && \
     clang \
     cmake
 
-RUN python -m pip install --upgrade pip && \
-    python -m pip install --upgrade wheel && \
-    python -m pip install --upgrade scons
+RUN python -m pip install --upgrade pip==20.3.3 && \
+    python -m pip install --upgrade wheel==0.36.2 && \
+    python -m pip install --upgrade scons==3.1.2
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
