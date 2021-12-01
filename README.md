@@ -27,9 +27,10 @@ To make the building process easier,
 we provide a Dockerfile under `docker/` and a script `cgem.sh`
 that will build the Docker image and compile Pinned Loads.
 Before you start, please set environment variable `GEM5_ROOT` to
-the root of Pinned Loads.
-(For example, if you cloned Pinned Loads to `$HOME/PinnedLoads`, execute
-`export GEM5_ROOT=$HOME/PinnedLoads` to set the variable.)
+the root of Pinned Loads (absolute path):
+```bash
+export GEM5_ROOT=<Path to Pinned Loads>  # e.g., export GEM5_ROOT=$HOME/PinnedLoads
+```
 Then, execute the script:
 ```bash
 ./cgem.sh
