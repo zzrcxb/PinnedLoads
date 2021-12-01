@@ -3,7 +3,7 @@ This directory contains the scripts for running Pinned Loads.
 
 Before using these scripts, you need to set the following environment variables:
 ```bash
-export GEM5_ROOT=<path to gem5 root>
+export GEM5_ROOT=<path to Pinned Loads>
 export M5_PATH=<path to the directory that contains full-system images and disks>
 export WORKLOADS_ROOT=<path to benchmark suites root>
 ```
@@ -119,7 +119,7 @@ then run it with the Fence scheme under the Spectre threat model for 1 million i
 ```
 
 ## Reproducibility
-To reproduce the Figure 7, 8, and 9,
+To reproduce the Figure 7, 8, and 9 in our paper,
 we provide two scripts `runner` and `plotter` to submit jobs and process results.
 Before you start, please make sure that all the required [Python libraries](requirements.txt) are installed.
 
