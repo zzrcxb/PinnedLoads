@@ -165,5 +165,6 @@ will generate Figure 7 (`perf-spec.pdf`) & 8 (`perf-sp.pdf`),
 and Figure 9 (`brkd.pdf`) respectively.
 
 ### Expected Results
-The generated plots should match its corresponding figure
-in the directory `expected`.
+Because the benchmark checkpoints can be different from the ones in our evaluation,
+the collected plots may not exactly match their corresponding figures in our paper,
+but they should be similar.
