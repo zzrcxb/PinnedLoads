@@ -15,8 +15,7 @@ booktitle = {Proceedings of the 27th ACM International Conference on Architectur
 }
 ```
 
-[You can find the Pinned Loads paper here!](http://iacoma.cs.uiuc.edu/work/chrono.html)
-(To appear at ASPLOS'22, coming soon)
+You can find the Pinned Loads paper [here](http://iacoma.cs.uiuc.edu/iacoma-papers/asplos22_2.pdf)!
 
 
 ## Building Pinned Loads
